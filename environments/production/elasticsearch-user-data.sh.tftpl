@@ -1,0 +1,104 @@
+#!/bin/bash
+# Elasticsearch ${es_version} for Temporal visibility (secret version ${secret_version}, ${secret_resource}).
+# Runs once at first boot. The password is read from Secrets Manager by the
+# instance role at every start, so it never appears in user data.
+set -euxo pipefail
+
+# The data volume is attached after the instance boots; wait for it.
+DEVICE=/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_${replace(volume_id, "-", "")}
+for _ in $(seq 1 120); do
+  [ -e "$DEVICE" ] && break
+  sleep 5
+done
+[ -e "$DEVICE" ] || { echo "data volume ${volume_id} never attached" >&2; exit 1; }
+
+# Format only a blank volume: a replaced host keeps the existing index.
+if ! blkid "$DEVICE"; then
+  mkfs.xfs "$DEVICE"
+fi
+mkdir -p /var/lib/elasticsearch
+UUID=$(blkid -s UUID -o value "$DEVICE")
+grep -q "$UUID" /etc/fstab || echo "UUID=$UUID /var/lib/elasticsearch xfs defaults,nofail 0 2" >> /etc/fstab
+mount -a
+chown -R 1000:0 /var/lib/elasticsearch
+
+echo 'vm.max_map_count=262144' > /etc/sysctl.d/99-elasticsearch.conf
+sysctl --system
+
+dnf install -y docker
+systemctl enable --now docker
+
+# The host sits in a public subnet: publish 9200 on the private IP only, so the
+# port stays closed to the internet even if the security group were opened.
+TOKEN=$(curl -sX PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')
+PRIVATE_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
+echo "PRIVATE_IP=$PRIVATE_IP" > /etc/elasticsearch.env
+
+cat > /usr/local/bin/run-elasticsearch <<'SCRIPT'
+#!/bin/bash
+set -euo pipefail
+. /etc/elasticsearch.env
+PASSWORD=$(aws secretsmanager get-secret-value --region ${region} --secret-id ${secret_arn} \
+  --query SecretString --output text | python3 -c 'import json,sys; print(json.load(sys.stdin)["password"])')
+docker rm -f elasticsearch >/dev/null 2>&1 || true
+exec docker run --name elasticsearch --rm \
+  -p "$PRIVATE_IP:9200:9200" \
+  -v /var/lib/elasticsearch:/usr/share/elasticsearch/data \
+  --ulimit nofile=65535:65535 --ulimit memlock=-1:-1 \
+  -e discovery.type=single-node \
+  -e node.name=elasticsearch \
+  -e bootstrap.memory_lock=true \
+  -e xpack.security.enabled=true \
+  -e xpack.security.enrollment.enabled=false \
+  -e xpack.security.http.ssl.enabled=false \
+  -e xpack.security.transport.ssl.enabled=false \
+  -e "ES_JAVA_OPTS=-Xms${es_heap} -Xmx${es_heap}" \
+  -e "ELASTIC_PASSWORD=$PASSWORD" \
+  --log-driver awslogs \
+  --log-opt awslogs-region=${region} \
+  --log-opt awslogs-group=${log_group} \
+  --log-opt awslogs-stream=elasticsearch \
+  docker.elastic.co/elasticsearch/elasticsearch:${es_version}
+SCRIPT
+chmod 700 /usr/local/bin/run-elasticsearch
+
+# ELASTIC_PASSWORD only applies on the very first start. After bumping
+# elasticsearch_password_version, run this on the host (Session Manager) to move
+# the elastic user from the previous secret value to the current one, then
+# restart the Temporal services.
+cat > /usr/local/bin/rotate-elastic-password <<'SCRIPT'
+#!/bin/bash
+set -euo pipefail
+. /etc/elasticsearch.env
+get() {
+  aws secretsmanager get-secret-value --region ${region} --secret-id ${secret_arn} --version-stage "$1" \
+    --query SecretString --output text | python3 -c 'import json,sys; print(json.load(sys.stdin)["password"])'
+}
+OLD=$(get AWSPREVIOUS)
+NEW=$(get AWSCURRENT)
+curl -sf -u "elastic:$OLD" -X POST "http://$PRIVATE_IP:9200/_security/user/elastic/_password" \
+  -H 'Content-Type: application/json' -d "{\"password\":\"$NEW\"}" >/dev/null
+echo "elastic password now matches the current secret; restart the temporal-* services"
+SCRIPT
+chmod 700 /usr/local/bin/rotate-elastic-password
+
+cat > /etc/systemd/system/elasticsearch.service <<'UNIT'
+[Unit]
+Description=Elasticsearch (Temporal visibility)
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/run-elasticsearch
+ExecStop=/usr/bin/docker stop -t 60 elasticsearch
+Restart=always
+RestartSec=10
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now elasticsearch

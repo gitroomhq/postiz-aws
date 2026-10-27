@@ -1,0 +1,122 @@
+name: terraform
+
+# Pull requests: fmt, validate and plan with the read-only role, plan posted as a comment.
+# main: plan + apply with the admin role, gated by the "production" environment
+# (Settings > Environments > production > Required reviewers).
+
+on:
+  pull_request:
+    paths:
+      - "environments/**"
+      - "modules/**"
+      - ".github/workflows/terraform.yml"
+  push:
+    branches: [main]
+    paths:
+      - "environments/**"
+      - "modules/**"
+      - ".github/workflows/terraform.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+
+concurrency:
+  group: terraform-production
+  cancel-in-progress: false
+
+# Account-specific values live in the repository settings, not in this public repo:
+#   variables TF_STATE_BUCKET, AWS_PLAN_ROLE_ARN, AWS_APPLY_ROLE_ARN;
+#   secrets CLOUDFLARE_API_TOKEN, AWS_ACCOUNT_ID, ALERT_EMAILS (HCL list, optional),
+#   TEMPORAL_UI_DOMAIN.
+# The account id and the Temporal UI's hostname are secrets so the public logs
+# print *** for them, also inside the state bucket name, ARNs and plans.
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_VERSION: "1.17.0"
+  AWS_REGION: us-east-2
+  WORKDIR: environments/production
+  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+  TF_VAR_aws_account_id: ${{ secrets.AWS_ACCOUNT_ID }}
+  TF_VAR_alert_emails: ${{ secrets.ALERT_EMAILS || '[]' }}
+  TF_VAR_temporal_ui_domain: ${{ secrets.TEMPORAL_UI_DOMAIN }}
+  TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+
+jobs:
+  plan:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: fmt
+        run: terraform fmt -check -recursive
+
+      - name: init
+        run: terraform -chdir=$WORKDIR init -input=false -backend-config="bucket=$TF_STATE_BUCKET"
+
+      - name: validate
+        run: terraform -chdir=$WORKDIR validate -no-color
+
+      - name: offline plan test (mocked providers)
+        run: terraform -chdir=$WORKDIR test -no-color
+
+      - name: plan
+        id: plan
+        run: |
+          set -o pipefail
+          # -refresh=false: the plan role cannot read any secret value (refreshing a
+          # secret version would need GetSecretValue); the apply job refreshes fully
+          terraform -chdir=$WORKDIR plan -refresh=false -input=false -lock-timeout=5m -no-color -out=tfplan | tee plan.txt
+
+      # The repository is public: the comment carries only the summary line, the
+      # full plan stays in the job log
+      - name: comment plan
+        if: always() && steps.plan.outcome != 'skipped'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.existsSync('plan.txt') ? fs.readFileSync('plan.txt', 'utf8') : '';
+            const summary = (plan.match(/^(Plan:|No changes\.).*$/m) || ['plan failed, see the job log'])[0];
+            const run = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            await github.rest.issues.createComment({ ...context.repo, issue_number: context.issue.number, body: `### terraform plan: ${summary}\n\n[Full plan in the job log](${run})` });
+
+  apply:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_APPLY_ROLE_ARN }}
+          role-duration-seconds: 7200
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: init
+        run: terraform -chdir=$WORKDIR init -input=false -backend-config="bucket=$TF_STATE_BUCKET"
+
+      - name: plan
+        run: terraform -chdir=$WORKDIR plan -input=false -lock-timeout=5m -no-color -out=tfplan
+
+      - name: apply
+        run: terraform -chdir=$WORKDIR apply -input=false -lock-timeout=5m -no-color tfplan

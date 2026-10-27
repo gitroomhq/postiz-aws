@@ -1,0 +1,46 @@
+name: ops-image
+
+# Builds the migration toolbox (docker/ops.Dockerfile) used by the "ops" task.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "docker/ops.Dockerfile"
+      - "scripts/**"
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  # Not used by the steps: referencing the secret makes the public logs print ***
+  # for the account id (role ARN, ECR registry).
+  AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+
+jobs:
+  build:
+    runs-on: ${{ vars.BUILD_RUNNER || 'ubuntu-24.04-arm' }}
+    environment: deploy
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: us-east-2
+
+      - name: ecr login
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/ops.Dockerfile
+          platforms: linux/arm64
+          push: true
+          provenance: false
+          tags: ${{ steps.ecr.outputs.registry }}/postiz-ops:latest
