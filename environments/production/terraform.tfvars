@@ -1,9 +1,10 @@
 # Public on purpose: everything account-specific comes from the environment
 # (TF_VAR_aws_account_id, TF_VAR_alert_emails, TF_VAR_temporal_ui_domain,
 # -backend-config bucket), see README.
-region            = "us-east-2"
-github_repository = "gitroomhq/postiz-aws"
-vpc_cidr          = "10.20.0.0/16"
+region              = "us-east-2"
+github_repository   = "gitroomhq/postiz-aws"
+github_oidc_subject = "repo:gitroomhq@128401275/postiz-aws@1436140501"
+vpc_cidr            = "10.20.0.0/16"
 
 # Cutover switches, flipped in order by docs/migration-runbook.md
 apps_enabled     = false

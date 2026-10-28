@@ -18,8 +18,24 @@ variable "environment" {
 }
 
 variable "github_repository" {
-  description = "owner/name of this repository, trusted by the deploy role."
+  description = "owner/name of this repository."
   type        = string
+}
+
+variable "github_oidc_subject" {
+  description = <<-EOT
+    Trusted by the deploy role, as in bootstrap/: start of the sub claim in this
+    repository's GitHub OIDC tokens, printed by
+    gh api repos/OWNER/NAME/actions/oidc/customization/sub --jq .sub_claim_prefix
+    Repositories created since July 2026 carry the owner and repository ids
+    (repo:owner@id/name@id), older ones repo:owner/name.
+  EOT
+  type        = string
+
+  validation {
+    condition     = can(regex("^repo:[^:]+$", var.github_oidc_subject))
+    error_message = "Only the prefix, for example repo:owner@123/name@456 (no :ref: or :environment: part)."
+  }
 }
 
 variable "vpc_cidr" {

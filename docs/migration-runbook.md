@@ -79,8 +79,11 @@ terraform -chdir=bootstrap init
 terraform -chdir=bootstrap apply
 ```
 
-A fork also sets `TF_VAR_github_repository` here (default `gitroomhq/postiz-aws`)
-and `github_repository` in `environments/production/terraform.tfvars`.
+A fork also sets `TF_VAR_github_repository` and `TF_VAR_github_oidc_subject` here
+(defaults: this repository) and the same two in
+`environments/production/terraform.tfvars`. The subject is what
+`gh api repos/<owner>/<name>/actions/oidc/customization/sub --jq .sub_claim_prefix`
+prints: repositories created since July 2026 put the owner and repository ids in it.
 Then create `environments/production/backend.hcl` from `backend.hcl.example`
 with the `state_bucket` output (the file is git-ignored). Optionally move the
 bootstrap state into that bucket too: uncomment the `backend "s3"` block in

@@ -46,7 +46,7 @@ provider "aws" {
 
 locals {
   state_bucket = "postiz-terraform-state-${var.aws_account_id}"
-  github_sub   = "repo:${var.github_repository}"
+  github_sub   = var.github_oidc_subject
 }
 
 # ---------------------------------------------------------------------------
