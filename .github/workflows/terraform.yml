@@ -1,8 +1,8 @@
 name: terraform
 
 # Pull requests: fmt, validate and plan with the read-only role, plan posted as a comment.
-# main: plan + apply with the admin role, gated by the "production" environment
-# (Settings > Environments > production > Required reviewers).
+# main: plan + apply with the admin role, in the "production" environment. It has no
+# required reviewers, so every push applies; add them to approve each apply first.
 
 on:
   pull_request:

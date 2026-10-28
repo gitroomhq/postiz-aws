@@ -121,14 +121,14 @@ the environment:
 | GitHub secret | `AWS_ACCOUNT_ID` | the only account Terraform may touch; a secret so the public logs print `***` for it |
 | GitHub secret | `ALERT_EMAILS` | optional, HCL list: `["ops@example.com"]` |
 | GitHub secret | `TEMPORAL_UI_DOMAIN` | the Temporal UI's hostname: a random name under the zone, `temporal-<random>.postiz.com` |
-| GitHub secret | `CLOUDFLARE_API_TOKEN` | Zone > DNS > Edit on the zone |
+| GitHub secret | `CLOUDFLARE_API_TOKEN` | Zone > Zone > Read and Zone > DNS > Edit, both on the zone only |
 | GitHub secret | `APP_REPO_TOKEN` | optional, only if the app repo is private |
 | GitHub variable | `TF_STATE_BUCKET` | state bucket, output of `bootstrap/` |
 | GitHub variable | `AWS_PLAN_ROLE_ARN`, `AWS_APPLY_ROLE_ARN` | outputs of `bootstrap/` |
 | GitHub variable | `AWS_DEPLOY_ROLE_ARN` | output of `environments/production` |
 | GitHub variable | `AUTO_DEPLOY` | `true` once AWS serves production |
 | GitHub variable | `BUILD_RUNNER`, `APP_REPOSITORY` | optional: arm64 runner label, app repo (default `gitroomhq/postiz-app`) |
-| GitHub environment | `production` | terraform apply: main branch only, required reviewers |
+| GitHub environment | `production` | terraform apply: main branch only, no reviewers, so every push to main applies (add required reviewers to approve each apply) |
 | GitHub environment | `deploy` | deploy-postiz and ops-image: main branch only, no reviewers |
 | Local shell | `TF_VAR_aws_account_id`, `TF_VAR_alert_emails`, `TF_VAR_temporal_ui_domain`, `AWS_PROFILE`, `CLOUDFLARE_API_TOKEN` | same values for local runs (an apply without `TF_VAR_alert_emails` removes the alert subscriptions) |
 | Local file | `environments/production/backend.hcl` | from `backend.hcl.example` (git-ignored) |
@@ -141,7 +141,7 @@ terraform -chdir=environments/production init -backend-config=backend.hcl
 ### Running this as a public repository
 
 - Pull requests from forks never get AWS credentials: GitHub gives no OIDC token to fork PRs, and the roles trust only this repository's pull requests and `main` (plan, read-only), the `production` environment (apply) and the `deploy` environment (deploys).
-- Turn on *Settings > Actions > Require approval for all outside collaborators*, and restrict both environments to the `main` branch; `production` also gets required reviewers.
+- Turn on *Settings > Actions > Require approval for all outside collaborators*, and restrict both environments to the `main` branch. Every push to `main` applies with the admin role, so write access to this repository means admin on the AWS account: keep it to the people who run production, or add required reviewers to `production`.
 - Actions logs of a public repository are public. They contain plans and deploy output (resource IDs, private hostnames), never secret values. The account id is a secret, so the logs print `***` for it, also inside ARNs and the ECR registry name; the alert emails are a secret and a sensitive Terraform variable. PR comments carry only the plan's summary line.
 - Automatic deploys only ship commits on the app's `main`: **deploy-postiz** checks a dispatched commit against the app repository before it builds anything, so a leaked dispatch token cannot deploy a branch or a fork's pull request.
 - The Temporal UI is public like on Railway, behind basic auth, on an unlisted hostname: a random name kept in the `TEMPORAL_UI_DOMAIN` secret and covered by a wildcard certificate, so it shows up neither in this repository, nor in the logs, nor in certificate transparency logs. `temporal_ui_allowed_cidrs` can limit it to a few IP ranges. Forks can keep the variable's default, `temporal_ui_public = false`: no public hostname at all, `scripts/temporal-ui-tunnel.sh` opens it through Session Manager.
@@ -165,9 +165,11 @@ docs/migration-runbook.md
 
 ## Day to day
 
-**Infrastructure changes:** open a PR. CI runs fmt, validate, the offline test and
-a plan (summary commented on the PR). Merging applies it after a reviewer approves
-the `production` environment. PR plans run with `-refresh=false`, because the
+**Infrastructure changes:** open a PR to see the plan first: CI runs fmt,
+validate, the offline test and a plan (summary commented on the PR). Every push
+to `main` that touches `environments/` or `modules/` applies right away, merges
+included, and a local apply that never reaches `main` is undone by the next
+push. PR plans run with `-refresh=false`, because the
 plan role cannot read any secret value. Do the same when planning with the
 read-only profile.
 

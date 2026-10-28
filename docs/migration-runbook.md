@@ -37,14 +37,14 @@ Not rehearsed: anything against the real Railway databases or AWS (that is A6 an
 - Tools on your machine: AWS CLI, Terraform >= 1.11,
   the [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)
   (for `aws ecs execute-command` and host shells), a Cloudflare API token with
-  *Zone > DNS > Edit* on `postiz.com`.
+  *Zone > Zone > Read* and *Zone > DNS > Edit* on `postiz.com` only.
 
 ```bash
 export AWS_PROFILE=<profile> AWS_REGION=us-east-2
 export TF_VAR_aws_account_id=<account id>
 export TF_VAR_alert_emails='["ops@example.com"]'   # same value as the GitHub secret ALERT_EMAILS
 export TF_VAR_temporal_ui_domain=<hostname>        # same value as the GitHub secret TEMPORAL_UI_DOMAIN
-export CLOUDFLARE_API_TOKEN=...                    # DNS edit on postiz.com
+export CLOUDFLARE_API_TOKEN=...                    # Zone Read + DNS Edit on postiz.com
 ```
 
 Pick the Temporal UI's hostname once, for example
@@ -92,8 +92,9 @@ bootstrap state into that bucket too: uncomment the `backend "s3"` block in
 - Variables: `TF_STATE_BUCKET`, `AWS_PLAN_ROLE_ARN` and `AWS_APPLY_ROLE_ARN`
   (bootstrap outputs).
 - Secrets: `AWS_ACCOUNT_ID`, `ALERT_EMAILS`, `TEMPORAL_UI_DOMAIN`, `CLOUDFLARE_API_TOKEN`.
-- Environment `production` with required reviewers and *Deployment branches:
-  main only*. The apply role only trusts jobs running in it.
+- Environment `production` with *Deployment branches: main only* and no
+  reviewers: every push to main that touches `environments/` or `modules/`
+  applies. The apply role only trusts jobs running in it.
 - Environment `deploy` with *Deployment branches: main only* and no reviewers.
   The deploy role only trusts jobs running in it, so pushes deploy without
   waiting for anyone.
@@ -103,7 +104,9 @@ bootstrap state into that bucket too: uncomment the `backend "s3"` block in
   write* on `gitroomhq/postiz-aws` only. Pushes to main are ignored by
   postiz-aws until `AUTO_DEPLOY` is set.
 
-**A3. First apply**, with every service at 0 tasks (`apps_enabled = false`):
+**A3. First apply**, with every service at 0 tasks (`apps_enabled = false`). The
+first push to main that touches `environments/` or `modules/` runs it in the
+**terraform** workflow. To run it locally instead, before that push:
 
 ```bash
 terraform -chdir=environments/production init -backend-config=backend.hcl
@@ -157,6 +160,12 @@ psql "${MAIN_ADMIN_URL/\/postiz?/\/postgres?}" -c 'drop database postiz with (fo
 ## Phase B: cutover (maintenance window)
 
 Budget the window from the A6 timings; expect roughly 45 to 90 minutes.
+
+Every "set ..., then apply" below is a change to `terraform.tfvars`. Push it to
+main and the **terraform** workflow applies it within a few minutes. A local
+apply is quicker in the window; push the same change straight after it, because
+the next push to main applies what main says and would undo a switch that only
+exists on your machine.
 
 | Step | Users see |
 |---|---|

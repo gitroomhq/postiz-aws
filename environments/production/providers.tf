@@ -18,5 +18,6 @@ provider "aws" {
   }
 }
 
-# Reads CLOUDFLARE_API_TOKEN (Zone > DNS > Edit on the postiz.com zone).
+# Reads CLOUDFLARE_API_TOKEN (Zone > Zone > Read for the zone lookup, Zone > DNS > Edit;
+# both on the postiz.com zone only).
 provider "cloudflare" {}
