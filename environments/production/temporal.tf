@@ -87,8 +87,12 @@ resource "aws_service_discovery_service" "temporal_frontend" {
     }
   }
 
-  # ECS reports task health (the frontend's container health check) to Cloud Map
-  health_check_custom_config {}
+  # ECS reports task health (the frontend's container health check) to Cloud Map.
+  # failure_threshold is deprecated (AWS always uses 1), but with an empty block
+  # every plan replaced this service.
+  health_check_custom_config {
+    failure_threshold = 1
+  }
 }
 
 module "temporal" {
