@@ -86,6 +86,11 @@ run "before_cutover" {
   }
 
   assert {
+    condition     = aws_route53_zone.api_inside_vpc.name == "api.postiz.com" && aws_route53_record.api_inside_vpc.name == "api.postiz.com"
+    error_message = "inside the VPC the API's public name must lead to this stack before the cutover too"
+  }
+
+  assert {
     condition     = contains(aws_acm_certificate.alb.subject_alternative_names, "*.postiz.com") && !contains(aws_acm_certificate.alb.subject_alternative_names, "temporal-0123456789ab.postiz.com")
     error_message = "the Temporal UI is covered by the wildcard, its unlisted name must not be on the certificate (certificate transparency logs are public)"
   }

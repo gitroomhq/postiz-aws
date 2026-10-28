@@ -61,3 +61,28 @@ resource "cloudflare_dns_record" "public" {
   proxied = false
   comment = "Postiz on AWS, managed by postiz-aws"
 }
+
+# Inside the VPC the API's public name always leads to this stack, also before
+# the cutover while Cloudflare still sends everyone else to Railway: the
+# frontend's server pages call the API by that name (BACKEND_INTERNAL_URL).
+# A zone for that one name only, so the rest of the zone resolves as usual.
+resource "aws_route53_zone" "api_inside_vpc" {
+  name    = var.api_domain
+  comment = "${var.api_domain} inside the VPC, managed by postiz-aws"
+
+  vpc {
+    vpc_id = module.network.vpc_id
+  }
+}
+
+resource "aws_route53_record" "api_inside_vpc" {
+  zone_id = aws_route53_zone.api_inside_vpc.zone_id
+  name    = var.api_domain
+  type    = "A"
+
+  alias {
+    name                   = aws_lb.main.dns_name
+    zone_id                = aws_lb.main.zone_id
+    evaluate_target_health = false
+  }
+}

@@ -149,14 +149,52 @@ by hand.
 B6 to B8 with `FORCE=1` while Railway keeps serving (no maintenance page,
 nothing stopped), to learn the timings and catch surprises. `FORCE=1` turns the
 "writers still connected" and "source changed during the copy" stops into
-warnings; never use it in the real window. Do **not** enable the apps. Then empty the targets again (inside the
-ops task; `copy temporal` recreates its database):
+warnings; never use it in the real window. Do **not** enable the apps. Then empty the targets again, inside the
+ops task:
 
 ```bash
-psql "${MAIN_ADMIN_URL/\/postiz?/\/postgres?}" -c 'drop database postiz with (force)' -c 'create database postiz' -c 'drop database temporal with (force)'
+migrate-postgres.sh reset   # empties postiz, temporal and the Temporal index, keeps the logins; asks you to type reset
 ```
 
-`es-copy-index.py --recreate` overwrites the index next time.
+**A7. Test run on empty databases (recommended).** The whole stack on empty
+databases, so Postiz on AWS is used end to end before any real data moves. It
+needs the logins A6 created (without A6: `migrate-postgres.sh init` with
+`API_DB_PASSWORD`, `MCP_DB_PASSWORD` and `WORKER_DB_PASSWORD` set to the
+passwords in the apps' `DATABASE_URL`s).
+
+1. After A6's `reset`, run **deploy-postiz** without `build_only`. This one
+   time `prisma db push` is meant to create the tables in the empty database.
+2. Set `apps_enabled = true` and `workers_enabled = true`, push, and wait until
+   the ECS services run. Temporal's auto-setup creates its schema and the
+   `default` namespace; the backend adds Postiz's search attributes when it starts.
+3. Open a test window. Only this browser window reaches AWS under the real
+   names; everyone else still lands on Railway. Inside AWS, the private zone for
+   `api.postiz.com` (dns.tf) sends the frontend's server pages to this backend too.
+
+   ```bash
+   open -na "Google Chrome" --args --user-data-dir="$HOME/.postiz-aws-test" \
+     --host-resolver-rules="MAP platform.postiz.com <cloudfront_domain>, MAP api.postiz.com <alb_dns_name>, MAP mcp.postiz.com <alb_dns_name>"
+   # values: terraform -chdir=environments/production output -raw cloudfront_domain (and alb_dns_name)
+   ```
+
+4. Register a test account in that window. With Stripe configured a new
+   account gets no channels, so give it a plan (ops task; test database only,
+   `reset` deletes it):
+
+   ```bash
+   psql "$MAIN_ADMIN_URL" -c "insert into \"Subscription\" (id, \"organizationId\", \"subscriptionTier\", period, \"totalChannels\", \"isLifetime\", \"updatedAt\") select 'test-' || id, id, 'ULTIMATE', 'MONTHLY', 100, true, now() from \"Organization\""
+   ```
+
+5. Check in the test window: connect a channel you own, upload an image,
+   schedule a post a few minutes ahead and see it published, and open the
+   Temporal UI (`terraform output -raw temporal_ui_url`, Railway's login).
+   Avoid Telegram (connecting reads the bot's updates, which production reads
+   too), VK until its IP allowlist has the AWS address, and the billing pages
+   (Stripe is live and its webhooks still go to Railway).
+6. Tear down: set `apps_enabled = false` and `workers_enabled = false`, push,
+   wait until every service runs 0 tasks, then `migrate-postgres.sh reset` in
+   the ops task. Valkey only holds short-lived entries keyed by the test
+   account; nothing to clear there.
 
 ---
 

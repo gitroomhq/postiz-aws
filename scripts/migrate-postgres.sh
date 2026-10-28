@@ -10,6 +10,9 @@
 #   migrate-postgres.sh init                      new installation, no Railway: create the roles
 #                                                 and the temporal database with passwords from
 #                                                 API_DB_PASSWORD, MCP_DB_PASSWORD, WORKER_DB_PASSWORD
+#   migrate-postgres.sh reset                     empty postiz, temporal and the Temporal search index
+#                                                 on AWS, keeping the logins (around the test run on
+#                                                 empty databases); refuses while anything is connected
 #
 # Both databases live on the one RDS instance:
 #   main      Railway "Postgres"      -> database postiz,   owned by "api"
@@ -20,6 +23,8 @@
 #                         (Railway > service > Variables > DATABASE_PUBLIC_URL)
 #   MAIN_ADMIN_URL        injected by the ops task (RDS master user, database postiz)
 #   TEMPORAL_DB_PASSWORD  injected by the ops task (Terraform-generated login of "temporal")
+#   TARGET_ES_URL         injected by the ops task (reset deletes the Temporal index there)
+#   ES_INDEX              Temporal visibility index, default temporal_visibility_v1_dev
 #   JOBS                  parallel dump/restore workers, default 8
 #   APP_ROLES             login roles the apps use on postiz, default "api mcp worker"
 #   NUM_HISTORY_SHARDS    expected Temporal shard count, default 4 (Terraform temporal_num_history_shards)
@@ -52,7 +57,7 @@ APP_ROLES=${APP_ROLES:-"api mcp worker"}
 ADMIN_URL=${MAIN_ADMIN_URL:?MAIN_ADMIN_URL missing, run this inside the ops task}
 
 usage() {
-  echo "usage: $0 preflight|copy main|temporal  |  $0 init  |  $0 temporal-password  |  $0 connection-limits" >&2
+  echo "usage: $0 preflight|copy main|temporal  |  $0 init  |  $0 reset  |  $0 temporal-password  |  $0 connection-limits" >&2
   exit 2
 }
 
@@ -96,6 +101,13 @@ case "$mode:$target" in
     OWNER_ROLE=$(echo "$APP_ROLES" | awk '{print $1}')
     : "${TEMPORAL_DB_PASSWORD:?TEMPORAL_DB_PASSWORD missing, run this inside the ops task}"
     ;;
+  reset:)
+    DB=postiz
+    OWNER_ROLE=$(echo "$APP_ROLES" | awk '{print $1}')
+    : "${TEMPORAL_DB_PASSWORD:?TEMPORAL_DB_PASSWORD missing, run this inside the ops task}"
+    : "${TARGET_ES_URL:?TARGET_ES_URL missing, run this inside the ops task}"
+    ES_INDEX=${ES_INDEX:-temporal_visibility_v1_dev}
+    ;;
   preflight:main | copy:main)
     DB=postiz
     OWNER_ROLE=$(echo "$APP_ROLES" | awk '{print $1}')
@@ -109,9 +121,12 @@ case "$mode:$target" in
     usage
     ;;
 esac
-[ "$mode" = init ] || : "${SOURCE_URL:?set SOURCE_URL to the Railway DATABASE_PUBLIC_URL of the source database}"
-# the admin URL with the target database name swapped in
-TARGET_URL=$(python3 -c 'import sys; from urllib.parse import urlsplit, urlunsplit; u = urlsplit(sys.argv[1]); print(urlunsplit(u._replace(path="/" + sys.argv[2])))' "$ADMIN_URL" "$DB")
+[ "$mode" = init ] || [ "$mode" = reset ] || : "${SOURCE_URL:?set SOURCE_URL to the Railway DATABASE_PUBLIC_URL of the source database}"
+# the admin URL with another database name swapped in
+admin_url_for() {
+  python3 -c 'import sys; from urllib.parse import urlsplit, urlunsplit; u = urlsplit(sys.argv[1]); print(urlunsplit(u._replace(path="/" + sys.argv[2])))' "$ADMIN_URL" "$1"
+}
+TARGET_URL=$(admin_url_for "$DB")
 
 src() { psql "$SOURCE_URL" -X -v ON_ERROR_STOP=1 "$@"; }
 dst() { psql "$TARGET_URL" -X -v ON_ERROR_STOP=1 "$@"; }
@@ -282,9 +297,39 @@ init() {
   echo "ready: set each service's DATABASE_URL to postgresql://<role>:<password>@<host>:5432/postiz?connection_limit=8&application_name=<role>"
 }
 
+# Back to empty databases for the test run, or after it, before the real copy.
+# The roles and their passwords stay, so the apps' DATABASE_URLs keep working;
+# prisma db push recreates the tables, Temporal's auto-setup its schema and index.
+reset() {
+  local maint others answer
+  maint=$(admin_url_for postgres)
+  others=$(psql "$maint" -X -Atc "select count(*) from pg_stat_activity where datname in ('$DB', 'temporal')")
+  if [ "$others" != 0 ]; then
+    psql "$maint" -X -c "select datname, usename, application_name, client_addr from pg_stat_activity where datname in ('$DB', 'temporal')"
+    # no FORCE here: a connection means an app, Temporal or a db push still uses these databases
+    echo "STOP: $others connections to $DB/temporal. Set apps_enabled = false, push, and wait until every service runs 0 tasks" >&2
+    exit 1
+  fi
+  read -r -p "This deletes all data in $DB, temporal and the $ES_INDEX index on AWS. Type reset to continue: " answer || true
+  [ "$answer" = reset ] || { echo "nothing changed" >&2; exit 1; }
+
+  psql "$maint" -X -v ON_ERROR_STOP=1 -q \
+    -c "drop database if exists \"$DB\" with (force)" -c "create database \"$DB\"" \
+    -c 'drop database if exists temporal with (force)'
+  # the same grants a copy sets up: prisma db push runs as the owner role
+  dst -q <<SQL
+grant connect, create, temporary on database "$DB" to "$OWNER_ROLE";
+grant all on schema public to "$OWNER_ROLE";
+SQL
+  prepare_temporal
+  curl -fsS -X DELETE "$TARGET_ES_URL/$ES_INDEX?ignore_unavailable=true" > /dev/null
+  echo "empty: $DB, temporal and $ES_INDEX; logins kept"
+}
+
 case "$mode" in
   preflight) preflight ;;
   copy) copy ;;
   init) init ;;
+  reset) reset ;;
   *) usage ;;
 esac
