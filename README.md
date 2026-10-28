@@ -271,7 +271,7 @@ It is `ReadOnlyAccess` plus Terraform state, with secret values,
 The modules are generic; `environments/production` is Postiz's own setup.
 
 1. Fork, change `github_repository`, `github_oidc_subject` (printed by `gh api repos/<owner>/<name>/actions/oidc/customization/sub --jq .sub_claim_prefix`), the domains, sizes and region in `environments/production/terraform.tfvars`, and set the secrets, variables and environments above (`bootstrap/` takes the same two from `TF_VAR_github_repository` and `TF_VAR_github_oidc_subject`).
-2. Follow phase A of the runbook. The Railway-specific steps (copying env vars and data) are optional. For a new installation, fill the Secrets Manager secrets by hand, then in the ops task (runbook B1) run `API_DB_PASSWORD=... MCP_DB_PASSWORD=... WORKER_DB_PASSWORD=... migrate-postgres.sh init`: it creates the app roles and the `temporal` database. The first **deploy-postiz** run creates the tables, and Temporal sets up its own schema on start.
+2. Follow phase A of the runbook. The Railway-specific steps (copying env vars and data) are optional. For a new installation, fill the Secrets Manager secrets by hand, then in the ops task (runbook B1) run `migrate-postgres.sh init`: it creates the app roles with the passwords of the backend, mcp and worker `DATABASE_URL`s, and the `temporal` database. The first **deploy-postiz** run creates the tables, and Temporal sets up its own schema on start.
 3. Your organization may allow different regions; ACM certificates for CloudFront always live in us-east-1.
 
 ## Not in this repo yet

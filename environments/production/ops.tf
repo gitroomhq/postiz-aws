@@ -49,6 +49,10 @@ module "ops" {
     MAIN_ADMIN_URL       = "${module.postgres_main.admin_secret_arn}:url::"
     TEMPORAL_DB_PASSWORD = "${aws_secretsmanager_secret.temporal_db.arn}:password::"
     TARGET_ES_URL        = "${aws_secretsmanager_secret.elasticsearch.arn}:url::"
+    # migrate-postgres.sh init creates the app roles with these URLs' passwords
+    API_DATABASE_URL    = local.app_secrets["backend"]["DATABASE_URL"]
+    MCP_DATABASE_URL    = local.app_secrets["mcp"]["DATABASE_URL"]
+    WORKER_DATABASE_URL = local.app_secrets["worker"]["DATABASE_URL"]
   }
 
   host_volumes = { work = "/var/lib/postiz-ops" }

@@ -7,9 +7,11 @@
 #   migrate-postgres.sh temporal-password         set the temporal role to the current secret
 #                                                 (after bumping temporal_db_password_version)
 #   migrate-postgres.sh connection-limits         re-apply the per-role connection caps below
-#   migrate-postgres.sh init                      new installation, no Railway: create the roles
-#                                                 and the temporal database with passwords from
-#                                                 API_DB_PASSWORD, MCP_DB_PASSWORD, WORKER_DB_PASSWORD
+#   migrate-postgres.sh init                      no data from Railway (new installation, test run):
+#                                                 create the roles and the temporal database, each
+#                                                 role with the password of the app DATABASE_URL the
+#                                                 ops task injects (API_/MCP_/WORKER_DATABASE_URL),
+#                                                 or of API_DB_PASSWORD, MCP_DB_PASSWORD, WORKER_DB_PASSWORD
 #   migrate-postgres.sh reset                     empty postiz, temporal and the Temporal search index
 #                                                 on AWS, keeping the logins (around the test run on
 #                                                 empty databases); refuses while anything is connected
@@ -191,10 +193,16 @@ prepare_main() {
     echo "set createrole_self_grant = 'set, inherit';"
     for role in $APP_ROLES; do
       if [ "$mode" = init ]; then
-        # new installation: the password from <ROLE>_DB_PASSWORD
+        # no source: the password from <ROLE>_DB_PASSWORD, else from <ROLE>_DATABASE_URL
+        # when that URL logs in as this role, so the apps' DATABASE_URLs work as they are
         var="$(echo "$role" | tr '[:lower:]' '[:upper:]')_DB_PASSWORD"
+        url_var="$(echo "$role" | tr '[:lower:]' '[:upper:]')_DATABASE_URL"
         hash="${!var:-}"
-        if [ -z "$hash" ]; then echo "set $var" >&2; exit 1; fi
+        if [ -z "$hash" ] && [ -n "${!url_var:-}" ]; then
+          hash=$(python3 -c 'import sys; from urllib.parse import urlsplit, unquote; u = urlsplit(sys.argv[1]); print(unquote(u.password or "") if u.username == sys.argv[2] else "")' "${!url_var}" "$role")
+        fi
+        if [ -z "$hash" ]; then echo "set $var, or $url_var to a URL that logs in as $role" >&2; exit 1; fi
+        hash=${hash//\'/\'\'}
       else
         # same password verifier as on Railway, so the DATABASE_URLs keep working
         hash=$(src -Atc "select rolpassword from pg_authid where rolname = '$role'")

@@ -157,13 +157,14 @@ migrate-postgres.sh reset   # empties postiz, temporal and the Temporal index, k
 ```
 
 **A7. Test run on empty databases (recommended).** The whole stack on empty
-databases, so Postiz on AWS is used end to end before any real data moves. It
-needs the logins A6 created (without A6: `migrate-postgres.sh init` with
-`API_DB_PASSWORD`, `MCP_DB_PASSWORD` and `WORKER_DB_PASSWORD` set to the
-passwords in the apps' `DATABASE_URL`s).
+databases, so Postiz on AWS is used end to end before any real data moves.
+Nothing is copied from Railway, so no Railway proxies are needed.
 
-1. After A6's `reset`, run **deploy-postiz** without `build_only`. This one
-   time `prisma db push` is meant to create the tables in the empty database.
+1. Open the ops toolbox (B1's commands) and run `migrate-postgres.sh init`: it
+   creates the app logins with the passwords of the apps' `DATABASE_URL`s and
+   the `temporal` database. After A6, run `migrate-postgres.sh reset` instead.
+   Then run **deploy-postiz** without `build_only`. This one time
+   `prisma db push` is meant to create the tables in the empty database.
 2. Set `apps_enabled = true` and `workers_enabled = true`, push, and wait until
    the ECS services run. Temporal's auto-setup creates its schema and the
    `default` namespace; the backend adds Postiz's search attributes when it starts.
