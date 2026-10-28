@@ -84,7 +84,8 @@ def railway_variables(service_id, unrendered=False):
 def terraform_outputs():
     out = subprocess.run(['terraform', f'-chdir={ENV_DIR}', 'output', '-json'], capture_output=True, text=True)
     if out.returncode != 0:
-        sys.exit(f'terraform output failed (apply environments/production first):\n{out.stderr}')
+        sys.exit('terraform output failed (run `terraform -chdir=environments/production init '
+                 f'-backend-config=backend.hcl` once, and apply environments/production first):\n{out.stderr}')
     return {k: v['value'] for k, v in json.loads(out.stdout).items()}
 
 
