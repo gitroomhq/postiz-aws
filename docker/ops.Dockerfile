@@ -10,7 +10,10 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 COPY scripts/ /opt/postiz/
-RUN chmod +x /opt/postiz/*
+# Linked into /usr/local/bin as well: tmux starts login shells, whose /etc/profile
+# resets PATH as root and drops /opt/postiz. The scripts find their siblings
+# through their own directory, so every script is linked.
+RUN chmod +x /opt/postiz/* && ln -s /opt/postiz/* /usr/local/bin/
 ENV PATH=/opt/postiz:$PATH
 # ECS Exec sets no TERM, and tmux refuses to start without one
 ENV TERM=xterm-256color
