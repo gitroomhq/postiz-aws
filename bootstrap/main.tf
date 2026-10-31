@@ -10,6 +10,8 @@
 #                                    branch can change the workflow, so it must stay weak)
 #   - postiz-github-terraform-apply  admin, only from the "production" GitHub environment
 #   - postiz-agent-readonly          for AI agents and humans poking around, cannot read secret values
+#   - postiz-team-readonly           for team members signing in through IAM Identity Center
+#                                    (account access manager), cannot read secret values
 
 terraform {
   required_version = ">= 1.11.0"
@@ -301,4 +303,62 @@ resource "aws_iam_role_policy" "agent_extra" {
   name   = "state-read-no-secrets"
   role   = aws_iam_role.agent_readonly.id
   policy = data.aws_iam_policy_document.agent_extra.json
+}
+
+# --- read-only role for team members ------------------------------------------
+# Assigned to IAM Identity Center users through account access manager (an
+# entitlement in the management account), the same way AccountFullAccessRole is.
+# Members sign in through the account access portal or with `aws login`.
+
+data "aws_iam_policy_document" "team_trust" {
+  statement {
+    actions = ["sts:AssumeRole", "sts:SetContext"]
+    principals {
+      type        = "Service"
+      identifiers = ["account-access.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "team_readonly" {
+  name                 = "postiz-team-readonly"
+  description          = "Read-only access for team members via account access manager, no secret values"
+  assume_role_policy   = data.aws_iam_policy_document.team_trust.json
+  max_session_duration = 43200
+}
+
+resource "aws_iam_role_policy_attachment" "team_readonly" {
+  role       = aws_iam_role.team_readonly.name
+  policy_arn = "arn:aws:iam::aws:policy/ReadOnlyAccess"
+}
+
+# Amazon Q Developer chat in the console. Q acts on AWS resources with the
+# caller's own permissions (q:PassRequest), so it is still limited to
+# ReadOnlyAccess and the NoSecretValues deny below.
+resource "aws_iam_role_policy_attachment" "team_readonly_amazon_q" {
+  role       = aws_iam_role.team_readonly.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonQDeveloperAccess"
+}
+
+data "aws_iam_policy_document" "no_secret_values" {
+  statement {
+    sid    = "NoSecretValues"
+    effect = "Deny"
+    actions = [
+      "secretsmanager:GetSecretValue",
+      "secretsmanager:BatchGetSecretValue",
+      "ssm:GetParameter",
+      "ssm:GetParameters",
+      "ssm:GetParametersByPath",
+      "ecs:ExecuteCommand",
+      "ssm:StartSession",
+    ]
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_role_policy" "team_readonly" {
+  name   = "no-secret-values"
+  role   = aws_iam_role.team_readonly.id
+  policy = data.aws_iam_policy_document.no_secret_values.json
 }

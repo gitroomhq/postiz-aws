@@ -142,6 +142,7 @@ run "cutover_window" {
 
   variables {
     apps_enabled     = true
+    workers_enabled  = false
     dns_cutover      = true
     maintenance_mode = true
   }

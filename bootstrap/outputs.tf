@@ -20,3 +20,8 @@ output "agent_readonly_role_arn" {
   description = "Add to ~/.aws/config as a profile whose source_profile is your admin profile"
   value       = aws_iam_role.agent_readonly.arn
 }
+
+output "team_readonly_role_arn" {
+  description = "Role to grant team members in account access manager (create-entitlement)"
+  value       = aws_iam_role.team_readonly.arn
+}

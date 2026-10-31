@@ -24,10 +24,11 @@ module "db_push" {
   log_retention_days = var.log_retention_days
 }
 
-# Migration toolbox (docker/ops.Dockerfile): PostgreSQL 16 client tools, python
-# and scripts/. Started idle; you work inside it with ECS Exec. Bridge mode so
-# it reaches both Railway's public TCP proxies and the private RDS/ES endpoints.
-# Dumps go to /work on the host's root volume.
+# Migration toolbox (docker/ops.Dockerfile): PostgreSQL 16 client tools, python,
+# the AWS CLI and scripts/. Started idle; you work inside it with ECS Exec. It
+# imports what the Railway toolbox exported (scripts/migration-transfer.sh):
+# reads the migration bucket with its task role, writes RDS and Elasticsearch.
+# Downloads go to /work on the host's root volume.
 module "ops" {
   source = "../../modules/ecs-service"
 
@@ -45,6 +46,12 @@ module "ops" {
   memory_reservation = 2048
   stop_timeout       = 10
 
+  environment = {
+    MIGRATION_BUCKET = aws_s3_bucket.migration.bucket
+    AWS_REGION       = var.region
+  }
+  task_role_policy_json = data.aws_iam_policy_document.ops_task.json
+
   secrets = {
     MAIN_ADMIN_URL       = "${module.postgres_main.admin_secret_arn}:url::"
     TEMPORAL_DB_PASSWORD = "${aws_secretsmanager_secret.temporal_db.arn}:password::"
@@ -59,4 +66,16 @@ module "ops" {
   mount_points = [{ volume = "work", path = "/work", read_only = false }]
 
   log_retention_days = var.log_retention_days
+}
+
+# The ops task downloads the dumps from the migration bucket (migration.tf)
+data "aws_iam_policy_document" "ops_task" {
+  statement {
+    actions   = ["s3:GetObject"]
+    resources = ["${local.migration_bucket_arn}/*"]
+  }
+  statement {
+    actions   = ["s3:ListBucket"]
+    resources = [local.migration_bucket_arn]
+  }
 }

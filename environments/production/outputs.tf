@@ -80,3 +80,13 @@ output "maintenance_bypass_token" {
   value       = random_password.maintenance_bypass.result
   sensitive   = true
 }
+
+output "migration_bucket" {
+  description = "Private bucket the Railway dumps travel through (runbook A5b, B6 to B8)"
+  value       = aws_s3_bucket.migration.bucket
+}
+
+output "migration_upload_role_arn" {
+  description = "Assume it right before an export; its temporary keys go into the Railway toolbox"
+  value       = aws_iam_role.migration_upload.arn
+}

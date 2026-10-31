@@ -20,6 +20,7 @@ Each step below was rehearsed locally with the same images and scripts:
 | Losing a history task | one of the two history tasks stopped | new workflows start and get indexed, existing ones stay readable |
 | Postiz image | `docker/postiz.Dockerfile` built from postiz-app main, run with the ECS commands against that Postgres and Temporal | no missing native libraries, `prisma-db-push` in sync (88 tables), backend `GET /` 200, worker polling Temporal, frontend `/favicon.ico` 200 |
 | Temporal UI basic auth | caddy 2.10.2 | 401 without credentials, `/healthz` open |
+| Data move without an open port (`migration-transfer.sh`) | Railway-like sources (2 Postgres 16, ES 8.19.10) -> toolbox container -> S3 stand-in -> ops container -> RDS-like target | every table identical, logins keep their Railway passwords, documents keep their versions; refused: an export while a writer is connected, a wrong digest, an extra or changed file in the bucket, an import into filled databases |
 
 Not rehearsed: anything against the real Railway databases or AWS (that is A6 and Phase B).
 
@@ -32,12 +33,17 @@ Not rehearsed: anything against the real Railway databases or AWS (that is A6 an
   to Redis would keep using the old copy after the cutover, because RDS and
   ElastiCache are private. Find them before the window: check the other Railway
   services' variables for references to `Postgres`, `PgBouncer` or `Redis`, and
-  read the connection list `migrate-postgres.sh preflight main` prints in A6.
+  read the connection list `migration-transfer.sh preflight` prints in A6.
   Stop them in B3 and move them to AWS next, or accept that their writes are lost.
 - Tools on your machine: AWS CLI, Terraform >= 1.11,
   the [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)
-  (for `aws ecs execute-command` and host shells), a Cloudflare API token with
-  *Zone > Zone > Read* and *Zone > DNS > Edit* on `postiz.com` only.
+  (for `aws ecs execute-command` and host shells), the Railway CLI 4 (`railway ssh`),
+  a Cloudflare API token with *Zone > Zone > Read* and *Zone > DNS > Edit* on
+  `postiz.com` only.
+- The data never crosses an open port. A temporary service inside the Railway
+  project reads it over Railway's private network and uploads it to a private
+  S3 bucket with one-hour, upload-only keys; the AWS ops task downloads and
+  restores it (`scripts/migration-transfer.sh`). No Railway database gets a TCP proxy.
 
 ```bash
 export AWS_PROFILE=<profile> AWS_REGION=us-east-2
@@ -64,8 +70,9 @@ is enforced by the scripts or the configuration, not left to memory:
 | Server build | `temporal_image` is pinned to the digest Railway runs (`auto-setup:1.28.0`, `sha256:3ee84bf3…`, checked against Docker Hub); the UI likewise (`ui:2.39.0`, `sha256:b768f87f…`) |
 | Workflow code replaying the histories | B0b builds the commit Railway runs, and the merge freeze keeps it that way |
 | Schema version and shard count | `migrate-postgres.sh` stops unless the source is at schema 1.17 with 4 shards, the values the AWS cluster runs |
-| Postgres and Elasticsearch frozen at the same moment | both copies stop if anything is still connected or writing: open connections on the source, or an index that changes during the copy |
-| Every row, every running workflow | all table row counts compared, running workflows compared in Postgres and in Elasticsearch |
+| Postgres and Elasticsearch frozen at the same moment | the exports stop if anything is still connected or writing: open connections on the source, or an index that changes while it is read |
+| Exactly the exported files | the import checks every file against the digest the export printed, and refuses anything else before it restores |
+| Every row, every running workflow | the import compares every table's row count, the running workflows in Postgres, and the documents and running workflows in Elasticsearch with what the export recorded |
 | Document versions in the index | copied with their external versions, so Temporal's later updates apply (rehearsed: terminate and new workflows after the move) |
 | Search attributes `organizationId`, `postId` | come with the database and the index mapping; auto-setup's sample attributes are disabled |
 | No double publishing | workers start only at go-live (B12); Railway's Temporal is deleted after it (B15) |
@@ -145,12 +152,46 @@ by hand.
   and tags it `:production` without `prisma db push`, which must not touch the
   empty database before the restore.
 
+**A5b. Railway toolbox** (once). A temporary service inside the Railway project
+that reads the databases over Railway's private network; nothing on Railway gets
+a public port.
+
+1. In the Postiz project, production environment: **New > GitHub Repo >
+   gitroomhq/postiz-aws**, named `migration-toolbox`.
+2. Variables (Raw Editor), with the bucket from
+   `terraform -chdir=environments/production output -raw migration_bucket`:
+
+   ```
+   RAILWAY_DOCKERFILE_PATH=docker/ops.Dockerfile
+   SOURCE_MAIN_URL=${{Postgres.DATABASE_URL}}
+   SOURCE_TEMPORAL_URL=${{Postgres-NlPS.DATABASE_URL}}
+   SOURCE_ES_URL=http://elastic:${{Elasticsearch.ELASTIC_PASSWORD}}@${{Elasticsearch.RAILWAY_PRIVATE_DOMAIN}}:9200
+   MIGRATION_BUCKET=<bucket>
+   AWS_REGION=us-east-2
+   ```
+
+3. Settings: custom start command `sleep infinity`; watch paths
+   `/docker/ops.Dockerfile` and `/scripts/**`, so the tfvars pushes in the window
+   do not restart it; no public domain, no TCP proxy.
+4. Attach a volume at `/work`, at least as large as the two databases (50 GB).
+5. On your machine, in this repository: `railway link` (the Postiz project,
+   production environment). `railway ssh --service migration-toolbox` opens a
+   shell in it, and `migration-transfer.sh preflight` there prints each source's
+   size, roles and current connections: a read-only test of the whole setup. It
+   ends with `not ready` for now, because the apps are connected and the upload
+   keys come in B6.
+
 **A6. Rehearse the data copy against live Railway (recommended).** Run B1 and
-B6 to B8 with `FORCE=1` while Railway keeps serving (no maintenance page,
-nothing stopped), to learn the timings and catch surprises. `FORCE=1` turns the
-"writers still connected" and "source changed during the copy" stops into
-warnings; never use it in the real window. Do **not** enable the apps. Then empty the targets again, inside the
-ops task:
+B6 to B8 with `FORCE=1` (`FORCE=1 migration-transfer.sh export`, then
+`FORCE=1 migration-transfer.sh import ...`) while Railway keeps serving (no
+maintenance page, nothing stopped), to learn the timings and catch surprises.
+`FORCE=1` turns the "writers still connected" and "source changed" stops, and
+the import's count comparisons, into warnings: the apps keep writing during a
+rehearsal. Never use it in the real window.
+
+Every AWS service stays at 0 tasks meanwhile (`apps_enabled = false`; tear down
+a running A7 test first): with real data in AWS, the workers would publish the
+scheduled posts a second time. Then empty the targets again, inside the ops task:
 
 ```bash
 migrate-postgres.sh reset   # empties postiz, temporal and the Temporal index, keeps the logins; asks you to type reset
@@ -158,7 +199,6 @@ migrate-postgres.sh reset   # empties postiz, temporal and the Temporal index, k
 
 **A7. Test run on empty databases (recommended).** The whole stack on empty
 databases, so Postiz on AWS is used end to end before any real data moves.
-Nothing is copied from Railway, so no Railway proxies are needed.
 
 1. Open the ops toolbox (B1's commands) and run `migrate-postgres.sh init`: it
    creates the app logins with the passwords of the apps' `DATABASE_URL`s and
@@ -168,15 +208,13 @@ Nothing is copied from Railway, so no Railway proxies are needed.
 2. Set `apps_enabled = true` and `workers_enabled = true`, push, and wait until
    the ECS services run. Temporal's auto-setup creates its schema and the
    `default` namespace; the backend adds Postiz's search attributes when it starts.
-3. Open a test window. Only this browser window reaches AWS under the real
-   names; everyone else still lands on Railway. Inside AWS, the private zone for
-   `api.postiz.com` (dns.tf) sends the frontend's server pages to this backend too.
-
-   ```bash
-   open -na "Google Chrome" --args --user-data-dir="$HOME/.postiz-aws-test" \
-     --host-resolver-rules="MAP platform.postiz.com <cloudfront_domain>, MAP api.postiz.com <alb_dns_name>, MAP mcp.postiz.com <alb_dns_name>"
-   # values: terraform -chdir=environments/production output -raw cloudfront_domain (and alb_dns_name)
-   ```
+3. Open the test window with `scripts/aws-test-browser.sh --fresh`. Only this
+   Chrome window reaches AWS under the real names; everyone else still lands on
+   Railway. Inside AWS, the private zone for `api.postiz.com` (dns.tf) sends the
+   frontend's server pages to this backend too. Use the script rather than a
+   copied command: Chrome silently drops a mapping that picked up a line break,
+   and the AWS frontend then talks to the Railway API, so a test account lands in
+   production. The script checks the API mapping before it opens the window.
 
 4. Register a test account in that window. With Stripe configured a new
    account gets no channels, so give it a plan (ops task; test database only,
@@ -226,8 +264,9 @@ exists on your machine.
 deployment (normally `main`). Otherwise AWS would start older code than the
 database it receives.
 
-**B1. Open the ops toolbox.** It runs as a bridge-mode task, so it reaches both
-Railway's public proxies and the private RDS/Elasticsearch endpoints:
+**B1. Open the ops toolbox** (AWS). Inside, `MAIN_ADMIN_URL`,
+`TEMPORAL_DB_PASSWORD`, `TARGET_ES_URL` and `MIGRATION_BUCKET` come from the task
+definition, and its role reads the migration bucket:
 
 ```bash
 TASK=$(aws ecs run-task --cluster postiz-production --task-definition postiz-production-ops \
@@ -237,11 +276,8 @@ aws ecs wait tasks-running --cluster postiz-production --tasks "$TASK"
 aws ecs execute-command --cluster postiz-production --task "$TASK" --container ops --interactive --command bash
 ```
 
-Open two or three sessions so the copies run in parallel. Inside,
-`MAIN_ADMIN_URL`, `TEMPORAL_DB_PASSWORD` and `TARGET_ES_URL` come from the task
-definition. On Railway, make sure each source has a TCP proxy (Settings >
-Networking): `Postgres`, `Postgres-NlPS`, and `Elasticsearch` on port 9200. The
-`DATABASE_PUBLIC_URL` variables appear once the proxy exists.
+Inside, run `tmux new -A -s migration`: the import keeps running if the session
+drops, and the same command reattaches.
 
 **B2. Maintenance page up, DNS to AWS.**
 
@@ -254,17 +290,9 @@ keeps answering whoever still has the old DNS cached until B3.
 **B3. Stop the writers on Railway:** scale `Backend Postiz`, `MCP`, `Worker`,
 `Worker 2`, `Frontend`, `PgBouncer` and the other services found in
 [Before you start](#before-you-start) to 0. PgBouncer goes too: it
-holds idle connections, and the copy refuses to start while anything is
+holds idle connections, and the export (B7) refuses to start while anything is
 connected to the source. Wait two minutes: Temporal indexes
 visibility asynchronously (about 50 seconds in the rehearsal).
-
-Record the running workflow count to compare later:
-
-```bash
-export SOURCE_ES_URL='http://elastic:<Railway ELASTIC_PASSWORD>@<es proxy host>:<port>'
-curl -s -H 'Content-Type: application/json' "$SOURCE_ES_URL/temporal_visibility_v1_dev/_count" \
-  -d '{"query":{"term":{"ExecutionStatus":"Running"}}}'
-```
 
 **B4. Stop Temporal on Railway:** scale `Temporal Frontend`, `History`,
 `Matching` and `Worker` to 0. Leave `Postgres`, `Postgres-NlPS` and `Elasticsearch` running.
@@ -273,28 +301,42 @@ curl -s -H 'Content-Type: application/json' "$SOURCE_ES_URL/temporal_visibility_
 `Postgres-NlPS` and `Elasticsearch` > Backups and create a backup of each volume.
 Nothing below writes to Railway, but these survive an accidental delete.
 
-**B6. Main database** (session 1):
+**B6. Railway toolbox: keys and a last check.**
+
+1. On your machine, in this repository: `scripts/migration-transfer.sh keys`.
+   It assumes the upload role for one hour and sets the keys on
+   `migration-toolbox`, which restarts with them. The keys can only upload to
+   the migration bucket: they cannot read, list or delete anything, and a file
+   overwritten with them fails the import's checks.
+2. `railway ssh --service migration-toolbox`, then `tmux new -A -s migration`.
+3. `migration-transfer.sh preflight`. It ends with `ready to export` once
+   nothing but the toolbox is connected (otherwise it lists who is) and the keys
+   work, and shows the history shards (must be 4) and the running workflows in
+   Postgres and Elasticsearch: note them for B11.
+
+**B7. Export** (Railway toolbox):
 
 ```bash
-export SOURCE_URL='<Railway Postgres DATABASE_PUBLIC_URL>'
-migrate-postgres.sh preflight main     # read the role/owner/extension report
-migrate-postgres.sh copy main          # ends with "OK: N tables, identical row counts"
+migration-transfer.sh export   # main, temporal and the index in parallel, then the upload;
+                               # ends with: migration-transfer.sh import <run> <digest>
 ```
 
-**B7. Temporal database** (session 2):
+If a part stops because something is still connected, stop that service and
+run it again. If the keys expire before the upload is done, repeat B6 step 1,
+reconnect, and run `migration-transfer.sh upload <run>`. The toolbox deletes its
+copy once the upload is done.
+
+**B8. Import** (ops toolbox from B1): paste the line B7 printed.
 
 ```bash
-export SOURCE_URL='<Railway Postgres-NlPS DATABASE_PUBLIC_URL>'
-migrate-postgres.sh preflight temporal   # history_shards must be 4; note running_workflows
-migrate-postgres.sh copy temporal        # creates role + database temporal, renames the schema_version row
+migration-transfer.sh import <run> <digest>
 ```
 
-**B8. Elasticsearch index** (session 3):
-
-```bash
-export SOURCE_ES_URL='http://elastic:<Railway ELASTIC_PASSWORD>@<es proxy host>:<port>'
-es-copy-index.py --index temporal_visibility_v1_dev     # ends with "OK: counts match"
-```
+It checks every file against the digest before it restores anything, then
+restores the three in parallel: the app roles keep their Railway passwords, and
+`temporal` gets its role, its database and the `schema_version` rename. It ends
+with `[main] OK: N tables, identical row counts`, the same for `[temporal]`,
+`[es] OK: counts match` and `import done`, and deletes its download.
 
 **B9. Hard copy on AWS** (from your machine; no downtime, Multi-AZ snapshots come from the standby):
 
@@ -321,7 +363,7 @@ TOKEN=$(terraform -chdir=environments/production output -raw maintenance_bypass_
 curl -s -o /dev/null -w '%{http_code}\n' -H "X-Postiz-Bypass: $TOKEN" https://api.postiz.com/        # 200
 curl -s -o /dev/null -w '%{http_code}\n' https://api.postiz.com/                                   # 503
 
-# from the ops task: same running count as in B3
+# from the ops task: same running count as in B6
 curl -s -H 'Content-Type: application/json' "$TARGET_ES_URL/temporal_visibility_v1_dev/_count" \
   -d '{"query":{"term":{"ExecutionStatus":"Running"}}}'
 ```
@@ -330,7 +372,7 @@ curl -s -H 'Content-Type: application/json' "$TARGET_ES_URL/temporal_visibility_
   `X-Postiz-Bypass`: log in on platform.postiz.com, open the calendar, open a post.
 - The Temporal UI (`terraform -chdir=environments/production output -raw temporal_ui_url`,
   the same basic-auth user and password as on Railway; the maintenance page does
-  not cover it) shows the running workflows: the same count as B3, and their
+  not cover it) shows the running workflows: the same count as B6, and their
   pending timers.
 - ECS console: every service has its tasks running and healthy, with no restart loops.
 
@@ -373,6 +415,9 @@ same apply.
 - Keep the other stopped Railway services and the databases for one to two weeks,
   then delete them. Their backups can stay longer.
 - Keep the `cutover` RDS snapshot for 30 days.
+- Delete `migration-toolbox` and its volume in Railway.
+- The migration bucket deletes each run after 7 days. Sooner:
+  `aws s3 rm --recursive s3://$(terraform -chdir=environments/production output -raw migration_bucket)/`
 - Raise the Cloudflare TTLs again.
 
 ---

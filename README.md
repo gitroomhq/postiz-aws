@@ -158,7 +158,7 @@ modules/
 environments/production/   everything else; app-env-keys.json = env var names per service
   tests/                   offline plan test with mocked providers
 docker/                    postiz.Dockerfile (app), ops.Dockerfile (migration toolbox)
-scripts/                   migration, env copy, Temporal UI tunnel, ECR retag
+scripts/                   migration, env copy, Temporal UI tunnel, test browser, ECR retag
 .github/workflows/         terraform (plan on PR, apply on main), deploy-postiz, ops-image
 docs/migration-runbook.md
 ```

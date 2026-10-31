@@ -1,24 +1,33 @@
 #!/usr/bin/env python3
 """Copy Temporal's Elasticsearch visibility index from Railway to AWS.
 
-Copies the index mapping, then every document with its _id and _version
-(external versioning, the same way Temporal writes them), then checks that
-both sides hold the same number of documents.
+Copies the index settings and mapping and the temporal* templates, then every
+document with its _id and _version (external versioning, the same way Temporal
+writes them), then checks that the target holds exactly the documents read,
+running workflows included.
 
 Credentials come from the environment, not the command line:
-  SOURCE_ES_URL  e.g. http://elastic:<password>@<railway-tcp-proxy>:<port>
+  SOURCE_ES_URL  e.g. http://elastic:<password>@elasticsearch.railway.internal:9200
   TARGET_ES_URL  e.g. http://elastic:<password>@elasticsearch.postiz.internal:9200
 
 Usage:
-  es-copy-index.py --index temporal_visibility_v1_dev [--batch 2000] [--recreate]
+  es-copy-index.py --index temporal_visibility_v1_dev [--batch 2000] [--recreate]   source -> target
+  es-copy-index.py --index temporal_visibility_v1_dev --export DIR                  source -> DIR
+  es-copy-index.py --import DIR [--recreate]                                       DIR -> target
 
-Stops if the source changes while it is copied (Temporal still running on
+The direct copy needs one machine that reaches both clusters. Without an open
+port, --export runs inside the Railway project and --import in the AWS ops
+task; scripts/migration-transfer.sh carries DIR (meta.json, docs.ndjson.gz)
+between them.
+
+Stops if the source changes while it is read (Temporal still running on
 Railway); FORCE=1 downgrades that to a warning for rehearsals.
 
 Standard library only, so it runs in any python:3 image.
 """
 import argparse
 import base64
+import gzip
 import json
 import os
 import ssl
@@ -86,56 +95,32 @@ def count(es, index, query=None):
 RUNNING = {'term': {'ExecutionStatus': 'Running'}}
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--index', required=True)
-    ap.add_argument('--batch', type=int, default=2000)
-    ap.add_argument('--recreate', action='store_true', help='delete the target index first if it already has documents')
-    ap.add_argument('--insecure', action='store_true', help='skip TLS verification (self-signed clusters)')
-    args = ap.parse_args()
-
-    src_url, dst_url = os.environ.get('SOURCE_ES_URL'), os.environ.get('TARGET_ES_URL')
-    if not src_url or not dst_url:
-        sys.exit('SOURCE_ES_URL and TARGET_ES_URL must be set')
-    src, dst = ES(src_url, args.insecure), ES(dst_url, args.insecure)
-    index = args.index
-
+def read_index(src, index):
+    """Settings, mapping and templates of the source index."""
     status, info = src.call('GET', f'/{index}')
     if status != 200:
         sys.exit(f'source index {index} not found on {src.base}: {status} {info}')
-    meta = info[index]
-    source_total = count(src, index)
-    source_running = count(src, index, RUNNING)
-    print(f'source {src.base}/{index}: {source_total} documents, {source_running} running workflows')
-
-    status, existing = dst.call('GET', f'/{index}', ok=(200, 404))
-    if status == 200:
-        target_total = count(dst, index)
-        if target_total and not args.recreate:
-            sys.exit(f'target index already has {target_total} documents, rerun with --recreate to replace it')
-        dst.call('DELETE', f'/{index}')
-        print(f'deleted existing target index ({target_total} documents)')
-
-    index_settings = {k: v for k, v in meta['settings']['index'].items() if k not in GENERATED_SETTINGS}
-    # single node on AWS: replicas would leave the index yellow forever
-    index_settings['number_of_replicas'] = '0'
-    status, body = dst.call('PUT', f'/{index}', {'settings': {'index': index_settings}, 'mappings': meta['mappings']})
-    if status not in (200, 201):
-        sys.exit(f'creating target index failed: {status} {body}')
-    print('target index created with the source mapping')
-
+    templates = []
     # templates too, so an index Temporal creates later matches
     for kind in ('_index_template', '_template'):
-        status, templates = src.call('GET', f'/{kind}/temporal*', ok=(200, 404))
+        status, found = src.call('GET', f'/{kind}/temporal*', ok=(200, 404))
         if status != 200:
             continue
-        items = templates.get('index_templates') if kind == '_index_template' else [{'name': k, 'index_template': v} for k, v in templates.items()]
-        for t in items or []:
-            dst.call('PUT', f'/{kind}/{t["name"]}', t['index_template'])
-            print(f'copied {kind} {t["name"]}')
+        items = found.get('index_templates') if kind == '_index_template' else [{'name': k, 'index_template': v} for k, v in found.items()]
+        templates += [{'kind': kind, 'name': t['name'], 'body': t['index_template']} for t in items or []]
+    return {
+        'index': index,
+        'settings': {k: v for k, v in info[index]['settings']['index'].items() if k not in GENERATED_SETTINGS},
+        'mappings': info[index]['mappings'],
+        'templates': templates,
+    }
 
-    copied = 0
-    status, page = src.call('POST', f'/{index}/_search?scroll=5m&version=true', {'size': args.batch, 'sort': ['_doc']})
+
+def read_documents(src, meta, batch):
+    """One _bulk body per scroll page; counts the documents (and running workflows) read into meta."""
+    index = meta['index']
+    meta['documents'] = meta['running'] = 0
+    status, page = src.call('POST', f'/{index}/_search?scroll=5m&version=true', {'size': batch, 'sort': ['_doc']})
     if status != 200:
         sys.exit(f'scroll failed: {status} {page}')
     scroll_id = page.get('_scroll_id')
@@ -147,35 +132,142 @@ def main():
                 action.update({'version': hit['_version'], 'version_type': 'external'})
             lines.append(json.dumps({'index': action}))
             lines.append(json.dumps(hit['_source']))
-        status, res = dst.call('POST', '/_bulk', '\n'.join(lines) + '\n', ndjson=True)
-        if status != 200:
-            sys.exit(f'bulk failed: {status} {res}')
-        if res.get('errors'):
-            failed = [i for i in res['items'] if i['index'].get('error')]
-            sys.exit(f'{len(failed)} documents failed, first: {failed[0]["index"]["error"]}')
-        copied += len(page['hits']['hits'])
-        print(f'copied {copied}/{source_total}', flush=True)
+            meta['running'] += hit['_source'].get('ExecutionStatus') == 'Running'
+        meta['documents'] += len(page['hits']['hits'])
+        yield '\n'.join(lines) + '\n'
         status, page = src.call('POST', '/_search/scroll', {'scroll': '5m', 'scroll_id': scroll_id})
         if status != 200:
             sys.exit(f'scroll failed: {status} {page}')
         scroll_id = page.get('_scroll_id', scroll_id)
     src.call('DELETE', '/_search/scroll', {'scroll_id': scroll_id}, ok=(200, 404))
 
-    # nothing may write to the source while it is copied: a moving source means
-    # Temporal still runs on Railway and the copy is already stale
-    if count(src, index) != source_total or count(src, index, RUNNING) != source_running:
-        message = 'the source index changed during the copy. Stop all four Temporal services on Railway, then rerun with --recreate'
-        if os.environ.get('FORCE') != '1':
-            sys.exit(f'STOP: {message}')
-        print(f'WARNING (FORCE=1): {message}')
+
+def check_frozen(src, meta, before):
+    """Nothing may write to the source while it is read: a moving source means
+    Temporal still runs on Railway and the copy is already stale."""
+    index = meta['index']
+    after = (count(src, index), count(src, index, RUNNING))
+    if after == before == (meta['documents'], meta['running']):
+        return
+    message = (f'the source index changed while it was read (documents/running: {before[0]}/{before[1]} before, '
+               f'{meta["documents"]}/{meta["running"]} read, {after[0]}/{after[1]} after). '
+               'Stop all four Temporal services on Railway, then run this again')
+    if os.environ.get('FORCE') != '1':
+        sys.exit(f'STOP: {message}')
+    print(f'WARNING (FORCE=1): {message}')
+
+
+def prepare_target(dst, meta, recreate):
+    index = meta['index']
+    status, _ = dst.call('GET', f'/{index}', ok=(200, 404))
+    if status == 200:
+        existing = count(dst, index)
+        if existing and not recreate:
+            sys.exit(f'target index already has {existing} documents, rerun with --recreate to replace it')
+        dst.call('DELETE', f'/{index}')
+        print(f'deleted existing target index ({existing} documents)')
+    settings = dict(meta['settings'])
+    # single node on AWS: replicas would leave the index yellow forever
+    settings['number_of_replicas'] = '0'
+    status, body = dst.call('PUT', f'/{index}', {'settings': {'index': settings}, 'mappings': meta['mappings']})
+    if status not in (200, 201):
+        sys.exit(f'creating target index failed: {status} {body}')
+    print('target index created with the source mapping')
+    for t in meta['templates']:
+        dst.call('PUT', f'/{t["kind"]}/{t["name"]}', t['body'])
+        print(f'copied {t["kind"]} {t["name"]}')
+
+
+def load(dst, bodies, expected):
+    loaded = 0
+    for body in bodies:
+        status, res = dst.call('POST', '/_bulk', body, ndjson=True)
+        if status != 200:
+            sys.exit(f'bulk failed: {status} {res}')
+        if res.get('errors'):
+            failed = [i for i in res['items'] if i['index'].get('error')]
+            sys.exit(f'{len(failed)} documents failed, first: {failed[0]["index"]["error"]}')
+        loaded += len(res['items'])
+        print(f'loaded {loaded}/{expected}', flush=True)
+
+
+def verify_target(dst, meta):
+    index = meta['index']
+    total, running = count(dst, index), count(dst, index, RUNNING)
+    print(f'target {dst.base}/{index}: {total} documents, {running} running workflows')
+    if (total, running) != (meta['documents'], meta['running']):
+        sys.exit(f'MISMATCH: {meta["documents"]}/{meta["running"]} read from the source, {total}/{running} in the target')
+    print('OK: counts match')
+
+
+def read_docs_file(path, batch):
+    """_bulk bodies of `batch` documents (an action line and a source line each) from an export."""
+    with gzip.open(path, 'rt') as f:
+        lines = []
+        for line in f:
+            lines.append(line)
+            if len(lines) == 2 * batch:
+                yield ''.join(lines)
+                lines = []
+        if lines:
+            yield ''.join(lines)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--index')
+    ap.add_argument('--batch', type=int, default=2000)
+    ap.add_argument('--recreate', action='store_true', help='delete the target index first if it already has documents')
+    ap.add_argument('--insecure', action='store_true', help='skip TLS verification (self-signed clusters)')
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument('--export', metavar='DIR', help='write the index to DIR instead of a target cluster')
+    mode.add_argument('--import', dest='import_dir', metavar='DIR', help='load an --export directory into the target cluster')
+    args = ap.parse_args()
+
+    def cluster(var):
+        url = os.environ.get(var)
+        if not url:
+            sys.exit(f'{var} must be set')
+        return ES(url, args.insecure)
+
+    if args.import_dir:
+        dst = cluster('TARGET_ES_URL')
+        with open(os.path.join(args.import_dir, 'meta.json')) as f:
+            meta = json.load(f)
+        print(f'import {meta["index"]}: {meta["documents"]} documents, {meta["running"]} running workflows')
+        prepare_target(dst, meta, args.recreate)
+        load(dst, read_docs_file(os.path.join(args.import_dir, 'docs.ndjson.gz'), args.batch), meta['documents'])
+        verify_target(dst, meta)
         return
 
-    target_total = count(dst, index)
-    target_running = count(dst, index, RUNNING)
-    print(f'target {dst.base}/{index}: {target_total} documents, {target_running} running workflows')
-    if target_total != source_total or target_running != source_running:
-        sys.exit(f'MISMATCH: source {source_total}/{source_running} vs target {target_total}/{target_running}')
-    print('OK: counts match')
+    if not args.index:
+        ap.error('--index is required')
+    src = cluster('SOURCE_ES_URL')
+    dst = None if args.export else cluster('TARGET_ES_URL')
+    meta = read_index(src, args.index)
+    before = (count(src, args.index), count(src, args.index, RUNNING))
+    print(f'source {src.base}/{args.index}: {before[0]} documents, {before[1]} running workflows')
+
+    if args.export:
+        if os.path.isdir(args.export) and os.listdir(args.export):
+            sys.exit(f'{args.export} is not empty: export into a new directory')
+        os.makedirs(args.export, exist_ok=True)
+        with gzip.open(os.path.join(args.export, 'docs.ndjson.gz'), 'wt', compresslevel=3) as f:
+            for body in read_documents(src, meta, args.batch):
+                f.write(body)
+                print(f'read {meta["documents"]}/{before[0]}', flush=True)
+        check_frozen(src, meta, before)
+        # written last and in one step: an export without meta.json is incomplete
+        with open(os.path.join(args.export, 'meta.json.tmp'), 'w') as f:
+            json.dump(meta, f)
+        os.replace(os.path.join(args.export, 'meta.json.tmp'), os.path.join(args.export, 'meta.json'))
+        print(f'exported {meta["documents"]} documents ({meta["running"]} running workflows) to {args.export}')
+        return
+
+    prepare_target(dst, meta, args.recreate)
+    load(dst, read_documents(src, meta, args.batch), before[0])
+    check_frozen(src, meta, before)
+    verify_target(dst, meta)
 
 
 if __name__ == '__main__':
