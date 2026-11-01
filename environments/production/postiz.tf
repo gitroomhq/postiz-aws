@@ -1,5 +1,5 @@
-# The Postiz group from Railway: Backend (2 replicas), MCP, Frontend, Worker,
-# Worker 2. Each runs its app's slim image (docker/postiz-app.Dockerfile) with the
+# The Postiz group from Railway: Backend (2 replicas), MCP (1 on Railway, 2 here),
+# Frontend, Worker, Worker 2. Each runs its app's slim image (docker/postiz-app.Dockerfile) with the
 # image's own command: the node process Railway's start:prod:* scripts ended in,
 # without pnpm in front. The command lives in the image because it depends on the
 # image's layout, so a rollback to an older image also gets that image's command.
@@ -38,13 +38,18 @@ locals {
       health_check = null
       publishes    = false
     }
+    # Two copies, so a crash or a lost server leaves one serving. Either copy can
+    # answer any request: /mcp runs stateless (serverless: true), and OAuth tokens
+    # and the self-hosted relay are looked up in the database. (Legacy SSE,
+    # /sse + /message, would need one copy, but it already fails on every
+    # message: postiz-app builds a new MCPServer per request.)
     mcp = {
       app          = "backend"
       port         = 8080
       cpu          = 512
       memory       = 6144
       reservation  = 2560
-      desired      = 1
+      desired      = 2
       autoscaling  = null
       target_group = "mcp"
       temporal     = true
