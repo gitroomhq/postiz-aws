@@ -9,8 +9,8 @@ vpc_cidr            = "10.20.0.0/16"
 # Cutover switches, flipped in order by docs/migration-runbook.md
 apps_enabled     = false
 workers_enabled  = false
-maintenance_mode = false
-dns_cutover      = false
+maintenance_mode = true
+dns_cutover      = true
 
 cloudflare_zone_name = "postiz.com"
 api_domain           = "api.postiz.com"
