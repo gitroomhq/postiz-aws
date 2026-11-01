@@ -20,8 +20,11 @@ resource "aws_ecr_repository" "app" {
   name                 = "postiz-app"
   image_tag_mutability = "IMMUTABLE_WITH_EXCLUSION"
 
+  # the release tags the deploy workflow moves: production (the all-in-one image
+  # from before the per-app split), <app>-production, and migrate-production (the
+  # schema the database has)
   image_tag_mutability_exclusion_filter {
-    filter      = "production"
+    filter      = "*production"
     filter_type = "WILDCARD"
   }
 
@@ -56,17 +59,33 @@ resource "aws_ecr_repository" "ops" {
 resource "aws_ecr_lifecycle_policy" "app" {
   repository = aws_ecr_repository.app.name
   policy = jsonencode({
+    # An image kept by a higher-priority rule is never expired by a later one, so
+    # rules 1 and 2 protect the images the services and the db push task run, however
+    # old: with one image per app, an app that rarely changes would otherwise fall
+    # out of "the last N" while frontend releases pile up.
     rules = [
       {
         rulePriority = 1
+        description  = "Keep every image a release tag points at"
+        selection    = { tagStatus = "tagged", tagPatternList = ["*production"], countType = "imageCountMoreThan", countNumber = 100 }
+        action       = { type = "expire" }
+      },
+      {
+        rulePriority = 2
+        description  = "Keep the image the db push task runs"
+        selection    = { tagStatus = "tagged", tagPatternList = ["migrate"], countType = "imageCountMoreThan", countNumber = 100 }
+        action       = { type = "expire" }
+      },
+      {
+        rulePriority = 3
         description  = "Drop untagged layers after a week"
         selection    = { tagStatus = "untagged", countType = "sinceImagePushed", countUnit = "days", countNumber = 7 }
         action       = { type = "expire" }
       },
       {
-        rulePriority = 2
-        description  = "Keep the last 40 releases for rollbacks"
-        selection    = { tagStatus = "any", countType = "imageCountMoreThan", countNumber = 40 }
+        rulePriority = 4
+        description  = "Keep the last 80 builds for rollbacks"
+        selection    = { tagStatus = "any", countType = "imageCountMoreThan", countNumber = 80 }
         action       = { type = "expire" }
       },
     ]

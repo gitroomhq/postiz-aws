@@ -80,6 +80,11 @@ mock_provider "cloudflare" {
 run "before_cutover" {
   command = plan
 
+  # terraform.tfvars holds the live switches, which are past the cutover now
+  variables {
+    dns_cutover = false
+  }
+
   assert {
     condition     = keys(cloudflare_dns_record.public) == ["temporal-0123456789ab.postiz.com"]
     error_message = "before the cutover the only public record is the Temporal UI's"
@@ -182,6 +187,7 @@ run "temporal_ui_private" {
   variables {
     temporal_ui_public = false
     temporal_ui_domain = null
+    dns_cutover        = false
   }
 
   assert {

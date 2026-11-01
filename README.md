@@ -157,7 +157,7 @@ modules/
   rds-postgres/            RDS with write-only admin password and alarms
 environments/production/   everything else; app-env-keys.json = env var names per service
   tests/                   offline plan test with mocked providers
-docker/                    postiz.Dockerfile (app), ops.Dockerfile (migration toolbox)
+docker/                    postiz-app.Dockerfile (one image per app), postiz.Dockerfile (all-in-one, before the split), ops.Dockerfile (migration toolbox)
 scripts/                   migration, env copy, Temporal UI tunnel, test browser, ECR retag
 .github/workflows/         terraform (plan on PR, apply on main), deploy-postiz, ops-image
 docs/migration-runbook.md
@@ -190,25 +190,39 @@ postiz-app's trigger skips commits that change no file outside the ignored paths
 so an empty commit (`git commit --allow-empty`) never deploys: test with a real
 one-line change.
 
-**Only the services a commit touches restart**, like Railway's watch paths
-(`scripts/deploy-plan.sh`, compared with the commit `:production` runs):
-`apps/frontend` only restarts the frontend, `apps/backend` adds backend and mcp,
-`apps/orchestrator` adds worker and worker-2, and `libraries/**` or the root build
-files restart everything. The frontend always restarts, as on Railway.
-`prisma db push` only runs when `schema.prisma`, `package.json` or `pnpm-lock.yaml`
-changed. Anything unclear (a rollback, rewritten history, a huge diff) restarts
-everything and runs db push, and so does every manual run. The deploy run's
-summary shows the plan. After a failed rollout, run **deploy-postiz** by hand once,
-so every service gets the release.
+**One slim image per app, built only when the app changed**
+(`docker/postiz-app.Dockerfile`; postiz-app's own all-in-one image stays the
+self-hosting path and is not changed):
+
+| Image | Services | Contents |
+|---|---|---|
+| `frontend-<sha>` | frontend | Next standalone server (switched on by a config wrapper at build time) |
+| `backend-<sha>` | backend, mcp | the backend build and only the files `main.js` loads (traced with `@vercel/nft`) |
+| `orchestrator-<sha>` | worker, worker-2 | the same for the workers, plus every file Temporal's workflow bundler reads at startup |
+| `migrate-<sha>` | db push task | Prisma CLI and `schema.prisma` |
+
+The **deploy-postiz** run has three jobs. **plan** (`scripts/deploy-plan.sh`)
+compares each app with the commit it runs now, the `<app>-<sha>` tag next to its
+`<app>-production` tag: `apps/frontend` touches the frontend, `apps/backend` the
+backend (and mcp), `apps/orchestrator` the workers, and `libraries/**` or the root
+build files every app. **build** builds only those images, in parallel, one job
+each, and reuses an image already pushed for the commit. **release** runs
+`prisma db push` when `schema.prisma` changed since the schema the database has
+(the commit on `migrate-production`, which only a successful push moves), moves
+`<app>-production` and restarts only those
+services. Anything unclear (no live image, a rollback, rewritten history, a huge
+diff) builds and restarts that app; every manual run does all of them. The run's
+summary shows the plan and why.
 
 You can also run **deploy-postiz** by hand with any ref. It builds `linux/arm64`
-and runs `pnpm run prisma-db-push` as a one-off task (Railway's pre-deploy
-command). It only moves `:production` and rolls the services if that
-succeeds. A failed rollout is rolled back by the ECS circuit breaker. Pushes
-that land while a deploy runs collapse into one deploy of the newest commit. To
-roll back a release, run **deploy-postiz** with the previous commit and
-`skip_db_push` checked. The image is reused, and `prisma db push` would refuse to
-drop columns the newer release added.
+and runs the db push as a one-off task (Railway's pre-deploy command), and only
+moves the release tags and rolls the services if that succeeds. A failed rollout
+is rolled back by the ECS circuit breaker; after a failed db push the next deploy
+pushes again. Pushes that land while a deploy runs
+collapse into one deploy of the newest commit. To roll back a release, run
+**deploy-postiz** with the previous commit and `skip_db_push` checked. Its images
+are reused when they exist, and `prisma db push` would refuse to drop columns the
+newer release added.
 
 **A new version only takes over once it is healthy.** Deploys are rolling:
 ECS starts the new tasks next to the old ones and stops an old task only after

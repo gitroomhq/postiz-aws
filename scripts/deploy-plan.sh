@@ -1,80 +1,119 @@
 #!/bin/bash
-# Decides which services an automatic deploy restarts and whether it runs prisma
-# db push, from the files changed since the commit :production runs now: the
-# AWS version of Railway's per-service watch paths. Used by .github/workflows/deploy.yml.
+# Decides which app images a deploy builds, which services it restarts and whether
+# it runs prisma db push: Railway's per-service watch paths, with each app compared
+# against the commit it runs now (the commit tag on its <app>-production image).
+# Used by .github/workflows/deploy.yml; images come from docker/postiz-app.Dockerfile.
 #
-#   frontend                    always (Railway rebuilt it on every push)
-#   backend, mcp                apps/backend/**
-#   worker, worker-2            apps/orchestrator/**
-#   all of them                 libraries/**, root build files, anything not listed below
-#   no service                  docs, .github, apps/extension|sdk|commands, local dev files
-#   prisma db push              schema.prisma, package.json or pnpm-lock.yaml changed
+#   frontend       apps/frontend/**       -> service frontend
+#   backend        apps/backend/**        -> services backend, mcp
+#   orchestrator   apps/orchestrator/**   -> services worker, worker-2
+#   every app      libraries/**, root build files, anything not listed as neutral
+#   no app         docs, .github, apps/extension|sdk|commands, local dev files
+#   prisma db push schema.prisma changed since the schema the database has: the
+#                  commit on migrate-production, which only a successful push moves
 #
-# Anything unclear rolls every service and runs db push: a manual run (rollbacks),
-# no commit tag on :production, a re-run of the live commit, a commit that is not
-# ahead of the live one, or a diff GitHub truncates. A needless restart is cheap,
-# a missed one is not. libraries/** always means everything: the workers import
-# react-shared-libraries, and helpers is used by every app.
+# An app is built and restarted when something that touches it changed since its
+# live commit, or when that is unclear: no live image yet, its commit is not an
+# ancestor (rollback, rewritten history), or GitHub cannot list the diff (300+
+# files). A re-run of the live commit restarts the app onto the existing image.
+# libraries/** means every app: the workers import react-shared-libraries, and
+# helpers is used everywhere. Manual runs build and restart everything.
 #
-# Environment: SHA (commit to deploy), EVENT (github.event_name), APP_REPOSITORY,
-# APP_TOKEN, REPOSITORY (ECR). For local checks: BASE skips the ECR lookup,
-# CHANGED_FILES (one path per line) skips GitHub.
-# Output: services=... and db_push=true|false, to $GITHUB_OUTPUT when set.
+# Environment: SHA, EVENT (github.event_name), APP_REPOSITORY, APP_TOKEN,
+# REPOSITORY (ECR). Local checks: LIVE_FRONTEND / LIVE_BACKEND /
+# LIVE_ORCHESTRATOR / LIVE_MIGRATE=<sha or empty> skip ECR, CHANGED_FILES (one
+# path per line, used for every comparison) skips GitHub.
+# Output: apps (JSON list), services (space-separated), db_push (true|false),
+# to $GITHUB_OUTPUT when set, plus a summary for the run page.
 set -euo pipefail
 : "${SHA:?}"
-ALL="backend mcp frontend worker worker-2"
+APPS="frontend backend orchestrator"
 
-result() { # services db_push reason
-  echo "services=$1"
-  echo "db_push=$2"
-  echo "why: $3"
-  if [ -n "${GITHUB_OUTPUT:-}" ]; then printf 'services=%s\ndb_push=%s\n' "$1" "$2" >> "$GITHUB_OUTPUT"; fi
-  if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-    printf '### Deploy plan\n- restarts: `%s`\n- prisma db push: %s\n- why: %s\n' "$1" "$2" "$3" >> "$GITHUB_STEP_SUMMARY"
-  fi
-  exit 0
+services_of() {
+  case $1 in
+    frontend) echo frontend ;;
+    backend) echo backend mcp ;;
+    orchestrator) echo worker worker-2 ;;
+  esac
 }
 
-if [ -n "${CHANGED_FILES+x}" ]; then
-  files=$CHANGED_FILES
-  base=${BASE:-local}
-else
-  [ "${EVENT:-}" = repository_dispatch ] || result "$ALL" true "manual run: every service"
-  : "${APP_REPOSITORY:?}" "${APP_TOKEN:?}" "${REPOSITORY:?}"
-  base=${BASE:-$(aws ecr describe-images --repository-name "$REPOSITORY" --image-ids imageTag=production \
-    --query 'imageDetails[0].imageTags' --output text 2>/dev/null | tr '\t' '\n' | grep -E '^[0-9a-f]{40}$' | head -1 || true)}
-  [ -n "$base" ] || result "$ALL" true "no commit tag on :production"
-  [ "$base" != "$SHA" ] || result "$ALL" true "$SHA is already :production (re-run)"
-  cmp=$(curl -fsSL -H "Authorization: Bearer $APP_TOKEN" -H 'Accept: application/vnd.github+json' \
-    "https://api.github.com/repos/$APP_REPOSITORY/compare/$base...$SHA") \
-    || result "$ALL" true "could not compare ${base:0:12}...${SHA:0:12}"
-  status=$(jq -r .status <<< "$cmp")
-  [ "$status" = ahead ] || result "$ALL" true "${SHA:0:12} is '$status' of the live ${base:0:12} (rollback or rewritten history)"
-  # GitHub lists at most 300 files per comparison
-  [ "$(jq '.files | length' <<< "$cmp")" -lt 300 ] || result "$ALL" true "300 or more files changed"
-  files=$(jq -r '.files[] | .filename, (.previous_filename // empty)' <<< "$cmp")
-fi
+# the commit an image tag runs: the <prefix><sha> tag next to it
+live() { # tag prefix
+  local var
+  var="LIVE_$(echo "$1" | sed 's/-production$//' | tr 'a-z-' 'A-Z_')"
+  if [ -n "${!var+x}" ]; then echo "${!var}"; return; fi
+  aws ecr describe-images --repository-name "$REPOSITORY" --image-ids imageTag="$1" \
+    --query 'imageDetails[0].imageTags' --output text 2>/dev/null \
+    | tr '\t' '\n' | sed -n "s/^$2\([0-9a-f]\{40\}\)\$/\1/p" | head -1 || true
+}
 
-backend=false workers=false all=false db_push=false
-while IFS= read -r f; do
-  [ -n "$f" ] || continue
-  case "$f" in
-    libraries/nestjs-libraries/src/database/prisma/schema.prisma | package.json | pnpm-lock.yaml) db_push=true ;;
-  esac
-  case "$f" in
-    apps/frontend/*) ;;
-    apps/backend/*) backend=true ;;
-    apps/orchestrator/*) workers=true ;;
+# files changed from a base commit to SHA; fails when that is unclear
+changed() { # base
+  if [ -n "${CHANGED_FILES+x}" ]; then printf '%s\n' "$CHANGED_FILES"; return 0; fi
+  local cmp status
+  cmp=$(curl -fsSL -H "Authorization: Bearer $APP_TOKEN" -H 'Accept: application/vnd.github+json' \
+    "https://api.github.com/repos/$APP_REPOSITORY/compare/$1...$SHA") || return 1
+  status=$(jq -r .status <<< "$cmp")
+  case $status in ahead | identical) ;; *) return 1 ;; esac
+  [ "$(jq '.files | length' <<< "$cmp")" -lt 300 ] || return 1
+  jq -r '.files[] | .filename, (.previous_filename // empty)' <<< "$cmp"
+}
+
+touches() { # file -> the app it touches, "all", or nothing
+  case $1 in
+    apps/frontend/*) echo frontend ;;
+    apps/backend/*) echo backend ;;
+    apps/orchestrator/*) echo orchestrator ;;
     *.md | .github/* | apps/extension/* | apps/sdk/* | apps/commands/* | Jenkins/* | reports/* | .claude/* | .devcontainer/* \
       | docker-compose*.yaml | Dockerfile.dev | railway.toml | .coderabbit.yaml | sonar-project.properties | .env.example) ;;
-    *) all=true ;;
+    *) echo all ;;
   esac
-done <<< "$files"
+}
 
-count=$(grep -c . <<< "$files" || true)
-range="${base:0:12}...${SHA:0:12}, $count files"
-if [ "$all" = true ]; then result "$ALL" "$db_push" "shared code or build files changed ($range)"; fi
-services="frontend"
-if [ "$backend" = true ]; then services="backend mcp $services"; fi
-if [ "$workers" = true ]; then services="$services worker worker-2"; fi
-result "$services" "$db_push" "no shared code changed ($range)"
+apps="" services="" db_push=false why=""
+note() { why="$why"$'\n'"- $1"; }
+
+if [ -z "${CHANGED_FILES+x}" ] && [ "${EVENT:-}" != repository_dispatch ]; then
+  apps="$APPS" db_push=true
+  note "manual run: every app"
+else
+  : "${APP_REPOSITORY:=}" "${APP_TOKEN:=}" "${REPOSITORY:=}"
+  for app in $APPS; do
+    base=$(live "$app-production" "$app-")
+    if [ -z "$base" ]; then apps="$apps $app"; note "$app: no live image yet"; continue; fi
+    if [ "$base" = "$SHA" ]; then apps="$apps $app"; note "$app: already on ${SHA:0:12}, restarting it"; continue; fi
+    if ! files=$(changed "$base"); then apps="$apps $app"; note "$app: cannot compare ${base:0:12}...${SHA:0:12}"; continue; fi
+    hit=""
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      t=$(touches "$f")
+      if [ "$t" = all ] || [ "$t" = "$app" ]; then hit=$f; break; fi
+    done <<< "$files"
+    if [ -n "$hit" ]; then apps="$apps $app"; note "$app: changed since ${base:0:12} ($hit)"
+    else note "$app: unchanged since ${base:0:12}"; fi
+  done
+  base=$(live migrate-production migrate-)
+  if [ -z "$base" ]; then db_push=true; note "db push: no schema pushed by this pipeline yet"
+  elif [ "$base" = "$SHA" ]; then note "db push: schema of ${SHA:0:12} already pushed"
+  elif ! files=$(changed "$base"); then db_push=true; note "db push: cannot compare ${base:0:12}...${SHA:0:12}"
+  elif grep -qxE 'libraries/nestjs-libraries/src/database/prisma/schema\.prisma' <<< "$files"; then
+    db_push=true; note "db push: schema.prisma changed since ${base:0:12}"
+  else note "db push: schema unchanged since ${base:0:12}"; fi
+fi
+
+for app in $apps; do services="$services $(services_of "$app")"; done
+apps=$(echo $apps)
+services=$(echo $services)
+build=$apps
+if [ "$db_push" = true ]; then build="$build migrate"; fi
+json=$(printf '%s\n' $build | jq -Rsc 'split("\n") | map(select(length > 0))')
+
+echo "apps=$json"
+echo "services=$services"
+echo "db_push=$db_push"
+echo "why:${why}"
+if [ -n "${GITHUB_OUTPUT:-}" ]; then printf 'apps=%s\nservices=%s\ndb_push=%s\n' "$json" "$services" "$db_push" >> "$GITHUB_OUTPUT"; fi
+if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+  printf '### Deploy plan for %s\n- builds: `%s`\n- restarts: `%s`\n- prisma db push: %s\n%s\n' \
+    "${SHA:0:12}" "${json}" "${services:-nothing}" "$db_push" "$why" >> "$GITHUB_STEP_SUMMARY"
+fi

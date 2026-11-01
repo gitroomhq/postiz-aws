@@ -1,24 +1,24 @@
 name: deploy-postiz
 
-# Railway's flow, on ECS:
-#   build postiz-app (arm64) -> push :<sha> and :migrate
-#   -> run `pnpm run prisma-db-push` (the Railway pre-deploy command) as a one-off task
-#   -> move :production to the new image -> roll the services the commit touches
-# Automatic deploys only restart the services whose files changed since the live
-# commit and skip db push when the schema did not change, like Railway's watch
-# paths (scripts/deploy-plan.sh); manual runs always roll every service. After a
-# failed rollout, run this workflow manually so every service gets the release.
-# Rollback: run this workflow with the previous commit as `ref` and skip_db_push
-# (prisma refuses to drop columns that hold data). The image is reused, not rebuilt.
+# postiz-app on ECS, one slim image per app (docker/postiz-app.Dockerfile):
+#   plan     which apps changed since the commit each one runs (scripts/deploy-plan.sh),
+#            like Railway's per-service watch paths
+#   build    only those app images, in parallel, one job each, plus the db push image
+#            when the schema changed; an image already pushed for the commit is reused
+#   release  prisma db push (the Railway pre-deploy command) as a one-off task, then
+#            move <app>-production to the new images and restart only their services:
+#            frontend -> frontend, backend -> backend + mcp, orchestrator -> worker + worker-2
+# Manual runs build and restart every app. Rollback: run this workflow with the
+# previous commit as `ref` and skip_db_push (prisma refuses to drop columns that
+# hold data); the images of that commit are reused when they exist.
 #
 # Automatic deploys: postiz-app's .github/workflows/deploy-aws.yml sends a
-# repository_dispatch on every push to main. They are ignored until the repo
-# variable AUTO_DEPLOY is "true" (set it at the cutover): before that, prisma db
-# push would initialise the empty RDS database the migration restores into.
-# Pushes that arrive while a deploy runs collapse into one: only the newest waits.
+# repository_dispatch on every push to main, ignored unless the repo variable
+# AUTO_DEPLOY is "true". Pushes that arrive while a deploy runs collapse into one:
+# only the newest waits.
 #
-# Runs in the "deploy" GitHub environment (main branch only, no reviewers), so
-# automatic deploys never wait for an approval; terraform apply keeps "production".
+# Every job runs in the "deploy" GitHub environment (main branch only, no
+# reviewers), the only one the deploy role trusts.
 
 on:
   workflow_dispatch:
@@ -28,7 +28,7 @@ on:
         required: true
         default: main
       build_only:
-        description: push the image and move :production without prisma db push or a rollout (before the data migration)
+        description: push the images and move <app>-production without prisma db push or a rollout
         type: boolean
         default: false
       skip_db_push:
@@ -56,29 +56,23 @@ env:
   CAPACITY_PROVIDER: postiz-production-ec2
   REPOSITORY: postiz-app
   DB_PUSH_TASK: postiz-production-db-push
-  SERVICES: backend mcp frontend worker worker-2
 
 jobs:
-  deploy:
+  plan:
     if: github.event_name == 'workflow_dispatch' || vars.AUTO_DEPLOY == 'true'
-    # arm64 runner: the ECS hosts are Graviton. Point BUILD_RUNNER at a
-    # self-hosted arm64 runner label if GitHub's are not available to the org.
-    runs-on: ${{ vars.BUILD_RUNNER || 'ubuntu-24.04-arm' }}
+    runs-on: ubuntu-24.04
     environment: deploy
-    timeout-minutes: 90
+    timeout-minutes: 10
+    outputs:
+      sha: ${{ steps.commit.outputs.sha }}
+      apps: ${{ steps.plan.outputs.apps }}
+      services: ${{ steps.plan.outputs.services }}
+      db_push: ${{ steps.plan.outputs.db_push }}
     steps:
       - name: checkout infra
         uses: actions/checkout@v4
         with:
           path: infra
-
-      - name: checkout postiz-app
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ env.APP_REPOSITORY }}
-          ref: ${{ github.event.inputs.ref || github.event.client_payload.ref || 'main' }}
-          token: ${{ secrets.APP_REPO_TOKEN || github.token }}
-          path: app
 
       # An automatic deploy only ships commits that are on the app's main branch,
       # so the dispatch token cannot deploy a branch or a fork's pull request.
@@ -86,11 +80,14 @@ jobs:
         id: commit
         env:
           APP_TOKEN: ${{ secrets.APP_REPO_TOKEN || github.token }}
+          REF: ${{ github.event.inputs.ref || github.event.client_payload.ref || 'main' }}
         run: |
-          sha=$(git -C app rev-parse HEAD)
+          api() { curl -fsSL -H "Authorization: Bearer $APP_TOKEN" -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/$APP_REPOSITORY/$1"; }
+          if ! [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]]; then echo "unexpected ref '$REF'" >&2; exit 1; fi
+          sha=$(api "commits/$REF" | jq -r .sha)
+          if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then echo "cannot resolve '$REF' in $APP_REPOSITORY" >&2; exit 1; fi
           if [ "$GITHUB_EVENT_NAME" = repository_dispatch ]; then
-            status=$(curl -fsSL -H "Authorization: Bearer $APP_TOKEN" \
-              "https://api.github.com/repos/$APP_REPOSITORY/compare/$sha...main" | jq -r .status)
+            status=$(api "compare/$sha...main" | jq -r .status)
             case "$status" in
               ahead | identical) echo "$sha is on main" ;;
               *) echo "$sha is not on main of $APP_REPOSITORY ($status), not deploying" >&2; exit 1 ;;
@@ -101,16 +98,9 @@ jobs:
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
-          role-duration-seconds: 7200
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: ecr login
-        id: ecr
-        uses: aws-actions/amazon-ecr-login@v2
-
-      # Which services this commit touches and whether the schema changed, compared
-      # with the commit :production runs now: before "promote to production" moves it.
-      - name: deploy plan
+      - name: plan
         id: plan
         env:
           SHA: ${{ steps.commit.outputs.sha }}
@@ -118,20 +108,60 @@ jobs:
           APP_TOKEN: ${{ secrets.APP_REPO_TOKEN || github.token }}
         run: infra/scripts/deploy-plan.sh
 
+  build:
+    needs: plan
+    if: needs.plan.outputs.apps != '[]'
+    strategy:
+      fail-fast: true
+      matrix:
+        app: ${{ fromJSON(needs.plan.outputs.apps) }}
+    name: build ${{ matrix.app }}
+    # arm64 runner: the ECS hosts are Graviton. Point BUILD_RUNNER at a
+    # self-hosted arm64 runner label if GitHub's are not available to the org.
+    runs-on: ${{ vars.BUILD_RUNNER || 'ubuntu-24.04-arm' }}
+    environment: deploy
+    timeout-minutes: 60
+    env:
+      TAG: ${{ matrix.app }}-${{ needs.plan.outputs.sha }}
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          role-duration-seconds: 3600
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: ecr login
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
       # rollbacks and re-runs reuse the image already pushed for this commit
       - name: existing image
         id: existing
         run: |
-          if aws ecr describe-images --repository-name "$REPOSITORY" \
-            --image-ids imageTag=${{ steps.commit.outputs.sha }} >/dev/null 2>&1; then
+          if aws ecr describe-images --repository-name "$REPOSITORY" --image-ids imageTag="$TAG" >/dev/null 2>&1; then
+            echo "$REPOSITORY:$TAG exists, not rebuilding"
             echo "found=true" >> "$GITHUB_OUTPUT"
-            infra/scripts/ecr-retag.sh "$REPOSITORY" ${{ steps.commit.outputs.sha }} migrate
           else
             echo "found=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: frontend build values
+      - name: checkout infra
         if: steps.existing.outputs.found != 'true'
+        uses: actions/checkout@v4
+        with:
+          path: infra
+
+      - name: checkout postiz-app
+        if: steps.existing.outputs.found != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.APP_REPOSITORY }}
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ secrets.APP_REPO_TOKEN || github.token }}
+          path: app
+
+      - name: frontend build values
+        if: steps.existing.outputs.found != 'true' && matrix.app == 'frontend'
         # only NEXT_PUBLIC_* keys, shell-quoted, handed to the build as a BuildKit secret
         run: |
           aws secretsmanager get-secret-value --secret-id postiz/production/frontend \
@@ -148,20 +178,43 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: app
-          file: infra/docker/postiz.Dockerfile
+          file: infra/docker/postiz-app.Dockerfile
+          target: ${{ matrix.app }}
           platforms: linux/arm64
           push: true
           provenance: false
-          tags: |
-            ${{ steps.ecr.outputs.registry }}/${{ env.REPOSITORY }}:${{ steps.commit.outputs.sha }}
-            ${{ steps.ecr.outputs.registry }}/${{ env.REPOSITORY }}:migrate
-          secret-files: |
-            frontend_env=${{ runner.temp }}/frontend.env
+          tags: ${{ steps.ecr.outputs.registry }}/${{ env.REPOSITORY }}:${{ env.TAG }}
+          secret-files: ${{ matrix.app == 'frontend' && format('frontend_env={0}/frontend.env', runner.temp) || '' }}
+
+  release:
+    needs: [plan, build]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
+    runs-on: ubuntu-24.04
+    environment: deploy
+    timeout-minutes: 60
+    env:
+      SHA: ${{ needs.plan.outputs.sha }}
+      APPS: ${{ needs.plan.outputs.apps }}
+    steps:
+      - name: checkout infra
+        uses: actions/checkout@v4
+        with:
+          path: infra
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          role-duration-seconds: 3600
+          aws-region: ${{ env.AWS_REGION }}
 
       # Runs once per deploy in its own task; the services never run it themselves.
+      # The task runs :migrate. Only a successful push moves migrate-production (the
+      # schema the database has, which the next plan compares with), so after a
+      # failed one the next deploy pushes again.
       - name: prisma db push
-        if: ${{ github.event.inputs.build_only != 'true' && github.event.inputs.skip_db_push != 'true' && steps.plan.outputs.db_push == 'true' }}
+        if: ${{ github.event.inputs.build_only != 'true' && github.event.inputs.skip_db_push != 'true' && needs.plan.outputs.db_push == 'true' }}
         run: |
+          infra/scripts/ecr-retag.sh "$REPOSITORY" "migrate-$SHA" migrate
           # deploys are serialized, but a cancelled run leaves its task running in ECS:
           # never start a second schema sync next to it
           while [ "$(aws ecs list-tasks --cluster "$CLUSTER" --family "$DB_PUSH_TASK" --desired-status RUNNING \
@@ -171,7 +224,7 @@ jobs:
           done
           task=$(aws ecs run-task --cluster "$CLUSTER" --task-definition "$DB_PUSH_TASK" \
             --capacity-provider-strategy capacityProvider=$CAPACITY_PROVIDER,weight=1 \
-            --started-by "deploy-${{ steps.commit.outputs.sha }}" \
+            --started-by "deploy-$SHA" \
             --query 'tasks[0].taskArn' --output text)
           echo "task $task"
           for _ in $(seq 1 4); do
@@ -184,14 +237,18 @@ jobs:
           reason=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$task" --query 'tasks[0].stoppedReason' --output text)
           echo "exit code: $code ($reason)"
           [ "$code" = "0" ]
+          infra/scripts/ecr-retag.sh "$REPOSITORY" "migrate-$SHA" migrate-production
 
       - name: promote to production
-        run: infra/scripts/ecr-retag.sh "$REPOSITORY" ${{ steps.commit.outputs.sha }} production
+        run: |
+          for app in $(jq -r '.[] | select(. != "migrate")' <<< "$APPS"); do
+            infra/scripts/ecr-retag.sh "$REPOSITORY" "$app-$SHA" "$app-production"
+          done
 
       - name: roll services
-        if: ${{ github.event.inputs.build_only != 'true' }}
+        if: ${{ github.event.inputs.build_only != 'true' && needs.plan.outputs.services != '' }}
         env:
-          SERVICES: ${{ steps.plan.outputs.services || env.SERVICES }}
+          SERVICES: ${{ needs.plan.outputs.services }}
         run: |
           for s in $SERVICES; do
             aws ecs update-service --cluster "$CLUSTER" --service "$s" --force-new-deployment --query 'service.serviceName' --output text
