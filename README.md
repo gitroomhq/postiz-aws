@@ -238,13 +238,13 @@ The load balancer sends traffic to a new task after 2 passing checks (15 s
 apart), and old tasks get 120 s to finish in-flight uploads. If new tasks keep
 failing (3 times for a 1-task service), the circuit breaker rolls the service
 back to the previous revision. That includes the previous image digest, even
-though `:production` moved. The deploy workflow fails if services are not
+though `<app>-production` moved. The deploy workflow fails if services are not
 stable within 30 minutes.
 
 **Schema changes run once per deploy:** the `db-push` one-off task, started by
-**deploy-postiz** and awaited before the rollout. The services only run
-`start:prod:*`: unlike the self-hosted image, a container start never touches
-the schema. Temporal's own schema check runs when a `temporal-frontend` task
+**deploy-postiz** and awaited before the rollout. The services only start their
+app (`node .../main.js`, `node server.js`, the image's own command): unlike the
+self-hosted image, a container start never touches the schema. Temporal's own schema check runs when a `temporal-frontend` task
 starts, but it changes nothing unless `temporal_image` moved to a newer release.
 For that upgrade, set `temporal_task_counts.frontend = 1` for the apply (so one
 task migrates), then back to 2.

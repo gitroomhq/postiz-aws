@@ -1,5 +1,8 @@
 # The Postiz group from Railway: Backend (2 replicas), MCP, Frontend, Worker,
-# Worker 2. Same start commands as Railway, one image built from postiz-app.
+# Worker 2. Each runs its app's slim image (docker/postiz-app.Dockerfile) with the
+# image's own command: the node process Railway's start:prod:* scripts ended in,
+# without pnpm in front. The command lives in the image because it depends on the
+# image's layout, so a rollback to an older image also gets that image's command.
 #
 # Bridge networking: containers reach the social APIs, R2 and RunPod through
 # their host's public IP (no NAT gateway).
@@ -22,7 +25,7 @@ locals {
 
   postiz_services = {
     backend = {
-      command      = ["pnpm", "run", "start:prod:backend"]
+      app          = "backend"
       port         = 8080
       cpu          = 1024
       memory       = 9216
@@ -36,7 +39,7 @@ locals {
       publishes    = false
     }
     mcp = {
-      command      = ["pnpm", "run", "start:prod:backend"]
+      app          = "backend"
       port         = 8080
       cpu          = 512
       memory       = 6144
@@ -50,7 +53,7 @@ locals {
       publishes    = false
     }
     frontend = {
-      command      = ["pnpm", "run", "start:prod:frontend"]
+      app          = "frontend"
       port         = 4200
       cpu          = 256
       memory       = 2048
@@ -64,7 +67,7 @@ locals {
       publishes    = false
     }
     worker = {
-      command      = ["pnpm", "run", "start:prod:orchestrator"]
+      app          = "orchestrator"
       port         = null
       cpu          = 512
       memory       = 7168
@@ -79,7 +82,7 @@ locals {
     }
     # its EXCLUDE_QUEUE comes with its secret, like on Railway
     worker-2 = {
-      command      = ["pnpm", "run", "start:prod:orchestrator"]
+      app          = "orchestrator"
       port         = null
       cpu          = 512
       memory       = 7168
@@ -106,8 +109,7 @@ module "postiz" {
   execution_role_arn     = aws_iam_role.execution.arn
   network_mode           = "bridge"
 
-  image              = local.app_image
-  command            = each.value.command
+  image              = local.app_images[each.value.app]
   cpu                = each.value.cpu
   memory             = each.value.memory
   memory_reservation = each.value.reservation
@@ -115,7 +117,8 @@ module "postiz" {
   stop_timeout       = 120
 
   environment = merge(
-    each.value.port != null && each.key != "frontend" ? { PORT = tostring(each.value.port) } : {},
+    # the frontend's standalone server reads PORT too (and binds 0.0.0.0: the image sets HOSTNAME)
+    each.value.port != null ? { PORT = tostring(each.value.port) } : {},
     each.value.temporal ? { TEMPORAL_ADDRESS = local.temporal_address } : {},
   )
   secrets = merge(

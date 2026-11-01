@@ -1,7 +1,9 @@
 # One-off tasks: no service, started with `aws ecs run-task`.
 
-# Railway's pre-deploy command. The deploy workflow pushes the new image as
-# :migrate, runs this to completion, and only then moves :production.
+# Railway's pre-deploy command (prisma db push). The deploy workflow points
+# :migrate at the new schema's image (Prisma CLI + schema.prisma, the
+# image's command runs the push), runs this to completion, and only then moves
+# the release tags.
 module "db_push" {
   source = "../../modules/ecs-service"
 
@@ -13,7 +15,6 @@ module "db_push" {
   execution_role_arn     = aws_iam_role.execution.arn
 
   image              = local.migrate_image
-  command            = ["pnpm", "run", "prisma-db-push"]
   cpu                = 512
   memory             = 3072
   memory_reservation = 1024

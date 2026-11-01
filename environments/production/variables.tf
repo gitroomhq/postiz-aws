@@ -149,7 +149,7 @@ variable "ecs_max_instances" {
 }
 
 variable "app_image_tag" {
-  description = "Mutable tag the deploy workflow moves to each release."
+  description = "Release tag suffix: each service runs <app>-<this>, which the deploy workflow moves to each release."
   type        = string
   default     = "production"
 }

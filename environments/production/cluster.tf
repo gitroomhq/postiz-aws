@@ -13,11 +13,12 @@ module "ecs_cluster" {
 
 # --- images --------------------------------------------------------------------------
 
-# One image for backend, MCP, frontend and both workers (the command differs).
-# Releases are pushed as <git sha> (immutable); "migrate" and "production" are
-# the two moving tags the deploy workflow updates.
+# One image per app (docker/postiz-app.Dockerfile), pushed as <app>-<git sha>
+# (immutable). The deploy workflow moves <app>-production, migrate (the db push
+# task's image) and migrate-production. "production" is the all-in-one image from
+# before the split, kept for rollbacks.
 resource "aws_ecr_repository" "app" {
-  name                 = "postiz-app"
+  name                 = local.app_repository
   image_tag_mutability = "IMMUTABLE_WITH_EXCLUSION"
 
   # the release tags the deploy workflow moves: production (the all-in-one image
@@ -40,6 +41,17 @@ resource "aws_ecr_repository" "app" {
   encryption_configuration {
     encryption_type = "AES256"
   }
+}
+
+# A service is only pointed at a release tag that exists (the first time, a
+# build_only run of deploy-postiz builds them): a missing tag fails the plan here
+# rather than leaving the service unable to pull its image. Read by name, not
+# through the repository resource, so the check always runs at plan time. Skipped
+# while the apps are off, so a new environment can be created before any image.
+data "aws_ecr_image" "app" {
+  for_each        = var.apps_enabled ? toset(local.apps) : toset([])
+  repository_name = local.app_repository
+  image_tag       = "${each.key}-${var.app_image_tag}"
 }
 
 # Migration toolbox: PostgreSQL 16 client tools + python + scripts/.

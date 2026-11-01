@@ -14,7 +14,15 @@ locals {
   elasticsearch_host     = "elasticsearch.${local.internal_domain}"
   temporal_address       = "${local.temporal_frontend_host}:7233"
 
-  app_image     = "${aws_ecr_repository.app.repository_url}:${var.app_image_tag}"
+  # one slim image per app (docker/postiz-app.Dockerfile), each with its own release
+  # tag: frontend-production, backend-production, orchestrator-production. Read
+  # through data.aws_ecr_image.app, so a missing tag fails the plan (cluster.tf).
+  app_repository = "postiz-app"
+  apps           = ["frontend", "backend", "orchestrator"]
+  app_images = {
+    for app in local.apps :
+    app => "${aws_ecr_repository.app.repository_url}:${try(data.aws_ecr_image.app[app].image_tag, "${app}-${var.app_image_tag}")}"
+  }
   migrate_image = "${aws_ecr_repository.app.repository_url}:migrate"
   ops_image     = "${aws_ecr_repository.ops.repository_url}:latest"
 

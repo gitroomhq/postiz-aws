@@ -140,6 +140,24 @@ run "after_cutover" {
     condition     = length(aws_sns_topic_subscription.email) == 1
     error_message = "one subscription per alert email"
   }
+
+  assert {
+    condition     = length(data.aws_ecr_image.app) == 3
+    error_message = "with the apps on, the plan checks that each app's release tag exists"
+  }
+}
+
+run "apps_off" {
+  command = plan
+
+  variables {
+    apps_enabled = false
+  }
+
+  assert {
+    condition     = length(data.aws_ecr_image.app) == 0
+    error_message = "with the apps off (a new environment), the plan needs no image"
+  }
 }
 
 run "cutover_window" {
