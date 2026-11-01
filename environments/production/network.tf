@@ -52,6 +52,19 @@ resource "aws_vpc_security_group_egress_rule" "alb_to_vpc" {
   description       = "Targets inside the VPC"
 }
 
+# Google sign-in for the Temporal UI: the load balancer itself calls Google's token
+# and user info endpoints, over IPv4 only. Their addresses are Google's and change,
+# so the rule cannot name them.
+resource "aws_vpc_security_group_egress_rule" "alb_to_idp" {
+  count             = local.temporal_ui_google_login ? 1 : 0
+  security_group_id = aws_security_group.alb.id
+  ip_protocol       = "tcp"
+  from_port         = 443
+  to_port           = 443
+  cidr_ipv4         = "0.0.0.0/0"
+  description       = "HTTPS to Google sign-in for the Temporal UI"
+}
+
 # Every Temporal task (frontend, history, matching, worker, UI).
 resource "aws_security_group" "temporal" {
   name        = "${local.name}-temporal"

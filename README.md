@@ -255,6 +255,22 @@ behind basic auth with the user and password from `postiz/production/temporal-ui
 hostname, and `scripts/temporal-ui-tunnel.sh` opens it on http://localhost:8081
 through Session Manager (needs the [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)).
 
+**Google sign-in in front of the public Temporal UI:** the load balancer sends
+everyone to Google's sign-in first, and only signed-in requests reach the UI (and
+its basic auth). Nothing in the app changes. To turn it on:
+1. In Google Cloud Console, in a project of the postiz.com Workspace: set up the
+   OAuth consent screen (Google Auth Platform) with the audience **Internal**, so
+   only Workspace accounts can sign in. The load balancer itself never checks
+   which account signed in.
+2. Create an OAuth client of type **Web application** with the authorized redirect
+   URI `https://<temporal_ui_domain>/oauth2/idpresponse`.
+3. Store its ID and secret as the repository secrets `TEMPORAL_UI_GOOGLE_CLIENT_ID`
+   and `TEMPORAL_UI_GOOGLE_CLIENT_SECRET`, then run the **terraform** workflow.
+   It adds the sign-in step to the UI's listener rule, and lets the load balancer
+   reach Google's token endpoint over HTTPS. A session lasts 12 hours, and signing
+   in again is a redirect without a prompt while the Google session lasts.
+Removing both secrets and running the workflow again turns it off.
+
 **Change an environment variable:**
 
 1. Edit the value in Secrets Manager (`postiz/production/<service>`).

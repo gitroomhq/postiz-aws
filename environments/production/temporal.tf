@@ -145,7 +145,8 @@ module "temporal" {
 # Same as Railway: temporalio/ui behind a Caddy basic-auth proxy. The
 # USERNAME/PASSWORD pair is copied from Railway's "Temporal Basic Auth" service.
 # Private by default: scripts/temporal-ui-tunnel.sh forwards localhost:8081 to it
-# through Session Manager; temporal_ui_public puts it behind the ALB instead.
+# through Session Manager; temporal_ui_public puts it behind the ALB instead, and
+# temporal_ui_google_client_id adds Google's sign-in in front of it there (alb.tf).
 
 locals {
   basic_auth_proxy = <<-EOT

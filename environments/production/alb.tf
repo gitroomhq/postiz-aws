@@ -196,6 +196,10 @@ locals {
       deregister_s = 15
     }
   } : {})
+
+  # Google sign-in in front of the public Temporal UI (temporal_ui_google_client_id);
+  # CI passes an empty string when the secret is not set
+  temporal_ui_google_login = var.temporal_ui_public && try(trimspace(var.temporal_ui_google_client_id), "") != ""
 }
 
 resource "aws_lb_target_group" "app" {
@@ -225,8 +229,36 @@ resource "aws_lb_listener_rule" "app" {
   listener_arn = aws_lb_listener.https.arn
   priority     = each.value.priority
 
+  # The Temporal UI first sends people to Google's sign-in: the load balancer
+  # trades the code for tokens itself (alb_to_idp), then keeps the session in a
+  # cookie. Only a signed-in request reaches the UI and its basic auth.
+  dynamic "action" {
+    for_each = each.key == "temporal-ui" && local.temporal_ui_google_login ? [1] : []
+    content {
+      type  = "authenticate-oidc"
+      order = 1
+      authenticate_oidc {
+        # from https://accounts.google.com/.well-known/openid-configuration
+        issuer                 = "https://accounts.google.com"
+        authorization_endpoint = "https://accounts.google.com/o/oauth2/v2/auth"
+        token_endpoint         = "https://oauth2.googleapis.com/token"
+        user_info_endpoint     = "https://openidconnect.googleapis.com/v1/userinfo"
+        client_id              = trimspace(var.temporal_ui_google_client_id)
+        client_secret          = trimspace(var.temporal_ui_google_client_secret)
+        scope                  = "openid email"
+        session_cookie_name    = "postiz-temporal-ui-auth"
+        # Signing in again after 12 hours is a redirect without a prompt while
+        # the Google session lasts; a stolen cookie stops working sooner.
+        session_timeout                     = 43200
+        on_unauthenticated_request          = "authenticate"
+        authentication_request_extra_params = { hd = var.temporal_ui_google_domain }
+      }
+    }
+  }
+
   action {
     type             = "forward"
+    order            = each.key == "temporal-ui" && local.temporal_ui_google_login ? 2 : null
     target_group_arn = aws_lb_target_group.app[each.key].arn
   }
 
@@ -245,6 +277,9 @@ resource "aws_lb_listener_rule" "app" {
       }
     }
   }
+
+  # the load balancer must be able to reach Google before it sends anyone there
+  depends_on = [aws_vpc_security_group_egress_rule.alb_to_idp]
 }
 
 # --- maintenance mode -------------------------------------------------------------------

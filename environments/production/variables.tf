@@ -134,6 +134,39 @@ variable "temporal_ui_allowed_cidrs" {
   }
 }
 
+variable "temporal_ui_google_client_id" {
+  description = <<-EOT
+    With temporal_ui_public, the load balancer sends everyone to Google's sign-in
+    before the Temporal UI (its basic auth stays behind it). A Google OAuth client
+    of type Web application, made in a Google Cloud project of the Workspace with
+    an Internal consent screen, so only the Workspace's accounts can sign in
+    (the load balancer itself never checks which account). Its redirect URI is
+    https://<temporal_ui_domain>/oauth2/idpresponse.
+    TF_VAR_temporal_ui_google_client_id; CI: secret TEMPORAL_UI_GOOGLE_CLIENT_ID.
+    Empty: no Google sign-in, basic auth only.
+  EOT
+  type        = string
+  default     = null
+}
+
+variable "temporal_ui_google_client_secret" {
+  description = "The OAuth client's secret (TF_VAR_temporal_ui_google_client_secret; CI: secret TEMPORAL_UI_GOOGLE_CLIENT_SECRET)."
+  type        = string
+  default     = null
+  sensitive   = true
+
+  validation {
+    condition     = try(trimspace(var.temporal_ui_google_client_id), "") == "" || try(trimspace(var.temporal_ui_google_client_secret), "") != ""
+    error_message = "temporal_ui_google_client_id is set, so the Google sign-in needs its client secret too."
+  }
+}
+
+variable "temporal_ui_google_domain" {
+  description = "Google Workspace domain whose account Google's sign-in page offers first (the Internal consent screen is what limits sign-in to it)."
+  type        = string
+  default     = "postiz.com"
+}
+
 # --- compute -------------------------------------------------------------------------
 
 variable "ecs_instance_type" {

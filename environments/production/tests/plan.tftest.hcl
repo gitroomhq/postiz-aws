@@ -199,6 +199,60 @@ run "temporal_ui_allowlist" {
   }
 }
 
+run "temporal_ui_google_login" {
+  command = plan
+
+  variables {
+    temporal_ui_google_client_id     = "1234567890-abc.apps.googleusercontent.com"
+    temporal_ui_google_client_secret = "test-secret"
+  }
+
+  assert {
+    condition     = [for a in aws_lb_listener_rule.app["temporal-ui"].action : a.type] == ["authenticate-oidc", "forward"]
+    error_message = "the Temporal UI rule sends people to Google's sign-in before the UI"
+  }
+
+  assert {
+    condition     = aws_lb_listener_rule.app["temporal-ui"].action[0].authenticate_oidc[0].authentication_request_extra_params["hd"] == "postiz.com"
+    error_message = "Google's sign-in page should offer the postiz.com account"
+  }
+
+  assert {
+    condition     = alltrue([for k, r in aws_lb_listener_rule.app : length(r.action) == 1 if k != "temporal-ui"])
+    error_message = "api, mcp and platform get no sign-in step"
+  }
+
+  assert {
+    condition     = length(aws_vpc_security_group_egress_rule.alb_to_idp) == 1 && aws_vpc_security_group_egress_rule.alb_to_idp[0].from_port == 443
+    error_message = "the load balancer needs HTTPS out to reach Google's token and user info endpoints"
+  }
+}
+
+# CI passes an empty string for a secret that is not set
+run "temporal_ui_google_login_unset_in_ci" {
+  command = plan
+
+  variables {
+    temporal_ui_google_client_id     = ""
+    temporal_ui_google_client_secret = ""
+  }
+
+  assert {
+    condition     = length(aws_lb_listener_rule.app["temporal-ui"].action) == 1 && length(aws_vpc_security_group_egress_rule.alb_to_idp) == 0
+    error_message = "without a Google client the Temporal UI keeps basic auth only and the load balancer gets no way out"
+  }
+}
+
+run "temporal_ui_google_login_needs_the_secret" {
+  command = plan
+
+  variables {
+    temporal_ui_google_client_id = "1234567890-abc.apps.googleusercontent.com"
+  }
+
+  expect_failures = [var.temporal_ui_google_client_secret]
+}
+
 run "temporal_ui_private" {
   command = plan
 

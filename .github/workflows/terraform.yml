@@ -42,6 +42,9 @@ env:
   TF_VAR_aws_account_id: ${{ secrets.AWS_ACCOUNT_ID }}
   TF_VAR_alert_emails: ${{ secrets.ALERT_EMAILS || '[]' }}
   TF_VAR_temporal_ui_domain: ${{ secrets.TEMPORAL_UI_DOMAIN }}
+  # Google sign-in in front of the Temporal UI; unset secrets turn it off
+  TF_VAR_temporal_ui_google_client_id: ${{ secrets.TEMPORAL_UI_GOOGLE_CLIENT_ID }}
+  TF_VAR_temporal_ui_google_client_secret: ${{ secrets.TEMPORAL_UI_GOOGLE_CLIENT_SECRET }}
   TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
 
 jobs:
