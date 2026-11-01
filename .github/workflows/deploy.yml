@@ -3,7 +3,11 @@ name: deploy-postiz
 # Railway's flow, on ECS:
 #   build postiz-app (arm64) -> push :<sha> and :migrate
 #   -> run `pnpm run prisma-db-push` (the Railway pre-deploy command) as a one-off task
-#   -> move :production to the new image -> roll backend, mcp, frontend, worker, worker-2
+#   -> move :production to the new image -> roll the services the commit touches
+# Automatic deploys only restart the services whose files changed since the live
+# commit and skip db push when the schema did not change, like Railway's watch
+# paths (scripts/deploy-plan.sh); manual runs always roll every service. After a
+# failed rollout, run this workflow manually so every service gets the release.
 # Rollback: run this workflow with the previous commit as `ref` and skip_db_push
 # (prisma refuses to drop columns that hold data). The image is reused, not rebuilt.
 #
@@ -104,6 +108,16 @@ jobs:
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
+      # Which services this commit touches and whether the schema changed, compared
+      # with the commit :production runs now: before "promote to production" moves it.
+      - name: deploy plan
+        id: plan
+        env:
+          SHA: ${{ steps.commit.outputs.sha }}
+          EVENT: ${{ github.event_name }}
+          APP_TOKEN: ${{ secrets.APP_REPO_TOKEN || github.token }}
+        run: infra/scripts/deploy-plan.sh
+
       # rollbacks and re-runs reuse the image already pushed for this commit
       - name: existing image
         id: existing
@@ -146,7 +160,7 @@ jobs:
 
       # Runs once per deploy in its own task; the services never run it themselves.
       - name: prisma db push
-        if: ${{ github.event.inputs.build_only != 'true' && github.event.inputs.skip_db_push != 'true' }}
+        if: ${{ github.event.inputs.build_only != 'true' && github.event.inputs.skip_db_push != 'true' && steps.plan.outputs.db_push == 'true' }}
         run: |
           # deploys are serialized, but a cancelled run leaves its task running in ECS:
           # never start a second schema sync next to it
@@ -176,6 +190,8 @@ jobs:
 
       - name: roll services
         if: ${{ github.event.inputs.build_only != 'true' }}
+        env:
+          SERVICES: ${{ steps.plan.outputs.services || env.SERVICES }}
         run: |
           for s in $SERVICES; do
             aws ecs update-service --cluster "$CLUSTER" --service "$s" --force-new-deployment --query 'service.serviceName' --output text

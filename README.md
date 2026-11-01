@@ -186,9 +186,24 @@ the extension, the SDK or CI. One-time setup:
 2. Save it in postiz-app as the secret `POSTIZ_AWS_DISPATCH_TOKEN`.
 3. Set the variable `AUTO_DEPLOY = true` in this repo at the cutover. Until then dispatches are ignored, because `prisma db push` must not touch the empty database before the restore.
 
+postiz-app's trigger skips commits that change no file outside the ignored paths,
+so an empty commit (`git commit --allow-empty`) never deploys: test with a real
+one-line change.
+
+**Only the services a commit touches restart**, like Railway's watch paths
+(`scripts/deploy-plan.sh`, compared with the commit `:production` runs):
+`apps/frontend` only restarts the frontend, `apps/backend` adds backend and mcp,
+`apps/orchestrator` adds worker and worker-2, and `libraries/**` or the root build
+files restart everything. The frontend always restarts, as on Railway.
+`prisma db push` only runs when `schema.prisma`, `package.json` or `pnpm-lock.yaml`
+changed. Anything unclear (a rollback, rewritten history, a huge diff) restarts
+everything and runs db push, and so does every manual run. The deploy run's
+summary shows the plan. After a failed rollout, run **deploy-postiz** by hand once,
+so every service gets the release.
+
 You can also run **deploy-postiz** by hand with any ref. It builds `linux/arm64`
 and runs `pnpm run prisma-db-push` as a one-off task (Railway's pre-deploy
-command). It only moves `:production` and rolls the five services if that
+command). It only moves `:production` and rolls the services if that
 succeeds. A failed rollout is rolled back by the ECS circuit breaker. Pushes
 that land while a deploy runs collapse into one deploy of the newest commit. To
 roll back a release, run **deploy-postiz** with the previous commit and
