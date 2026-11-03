@@ -22,9 +22,21 @@ locals {
   ses_configuration_set_arn = "arn:aws:ses:${var.region}:${var.aws_account_id}:configuration-set/${local.name}"
 }
 
+# Managed dedicated IPs: SES leases, warms up (per mailbox provider) and scales the
+# IPs itself, sending what the pool is not warm enough for through the shared pool.
+# $15/month + $0.08 per 1,000 mails (a la carte pricing).
+resource "aws_sesv2_dedicated_ip_pool" "main" {
+  pool_name    = local.name
+  scaling_mode = "MANAGED"
+}
+
 resource "aws_sesv2_configuration_set" "main" {
   configuration_set_name = local.name
 
+  # every mail goes through this set (identity default), so through the pool
+  delivery_options {
+    sending_pool_name = aws_sesv2_dedicated_ip_pool.main.pool_name
+  }
   reputation_options {
     reputation_metrics_enabled = true
   }

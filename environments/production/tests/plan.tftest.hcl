@@ -319,6 +319,11 @@ run "ses" {
     condition     = aws_sesv2_email_identity_mail_from_attributes.domain.mail_from_domain == "ses-mail.postiz.com" && cloudflare_dns_record.ses_mail_from_mx.content == "feedback-smtp.us-east-2.amazonses.com"
     error_message = "the MAIL FROM is its own subdomain (send.postiz.com is Resend's) with an MX in the sending region"
   }
+
+  assert {
+    condition     = aws_sesv2_dedicated_ip_pool.main.scaling_mode == "MANAGED" && aws_sesv2_configuration_set.main.delivery_options[0].sending_pool_name == "postiz-production"
+    error_message = "mail goes out through the managed dedicated IP pool, set on the identity's default configuration set"
+  }
 }
 
 run "ses_sending_enabled" {
