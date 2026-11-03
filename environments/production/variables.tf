@@ -285,6 +285,12 @@ variable "log_retention_days" {
   default = 30
 }
 
+variable "team_readonly_role_name" {
+  description = "The team's read-only role from bootstrap/. db-readers.tf adds CloudShell inside the VPC and the database's readonly sign-in to it."
+  type        = string
+  default     = "postiz-team-readonly"
+}
+
 # Bump to rotate a Terraform-generated password. The resource and its secret are
 # rewritten together; running tasks keep the old value until they restart.
 variable "main_db_password_version" {

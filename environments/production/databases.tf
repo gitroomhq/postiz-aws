@@ -27,9 +27,14 @@ module "postgres_main" {
   vpc_id     = module.network.vpc_id
   subnet_ids = module.network.private_subnet_ids
   allowed_security_group_ids = {
-    ecs-hosts = module.ecs_cluster.instance_security_group_id
-    temporal  = aws_security_group.temporal.id
+    ecs-hosts  = module.ecs_cluster.instance_security_group_id
+    temporal   = aws_security_group.temporal.id
+    db-readers = aws_security_group.db_readers.id # the team's CloudShell, db-readers.tf
   }
+
+  # For the team's "readonly" role only (db-readers.tf); the apps and Temporal
+  # keep signing in with their passwords.
+  iam_database_authentication = true
 
   parameters = {
     log_min_duration_statement = { value = "1000", apply_method = "immediate" }

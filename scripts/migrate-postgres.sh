@@ -16,6 +16,10 @@
 #   migrate-postgres.sh temporal-password             set the temporal role to the current secret
 #                                                     (after bumping temporal_db_password_version)
 #   migrate-postgres.sh connection-limits             re-apply the per-role connection caps below
+#   migrate-postgres.sh readonly-role                 create or refresh "readonly", the team's login for
+#                                                     queries from CloudShell: IAM token sign-in, no
+#                                                     password, credential columns hidden; run it again
+#                                                     after schema changes
 #   migrate-postgres.sh init                          no data from Railway (new installation, test run):
 #                                                     create the roles and the temporal database, each
 #                                                     role with the password of the app DATABASE_URL the
@@ -45,6 +49,8 @@
 #   WORKER_CONNECTIONS    cap for the worker role, default 64 (8 per process: up to 8 worker tasks)
 #   MCP_CONNECTIONS       cap for the mcp role, default 100 (Prisma 8 + Mastra's pool per task)
 #   TEMPORAL_CONNECTIONS  cap for the temporal role, default 400 (20 per Temporal task, deploys double them)
+#   READONLY_CONNECTIONS  cap for the readonly role, default 5
+#   READONLY_STATEMENT_TIMEOUT  longest statement the readonly role may run, default 60s
 #
 # Per-role caps: Postgres refuses a role's connection beyond its cap, so a
 # runaway worker or Temporal can never take connections the API (role api,
@@ -71,7 +77,7 @@ APP_ROLES=${APP_ROLES:-"api mcp worker"}
 ADMIN_URL=${MAIN_ADMIN_URL:-}
 
 usage() {
-  echo "usage: $0 preflight|copy main|temporal  |  $0 export|import main|temporal DIR  |  $0 init  |  $0 reset  |  $0 temporal-password  |  $0 connection-limits" >&2
+  echo "usage: $0 preflight|copy main|temporal  |  $0 export|import main|temporal DIR  |  $0 init  |  $0 reset  |  $0 temporal-password  |  $0 connection-limits  |  $0 readonly-role" >&2
   exit 2
 }
 
@@ -131,6 +137,135 @@ connection_limits() {
     admin -qc "alter role temporal connection limit ${TEMPORAL_CONNECTIONS:-400}"
   fi
   admin -c "select rolname, rolconnlimit as connection_limit from pg_roles where rolname in ('api', 'mcp', 'worker', 'temporal') order by 1"
+}
+
+# The team's read-only login (environments/production/db-readers.tf). They query
+# from CloudShell inside the VPC and sign in with an IAM token (rds_iam), so the
+# role has no password. It reads every table in public, but the tables below only
+# through column grants that leave out the columns holding credentials: OAuth
+# tokens and codes, API keys, password hashes, client secrets, webhook URLs (some
+# are bearer URLs), Mastra's chat-platform installs and MCP client configs.
+# Run it again after a schema change: new tables, and columns Prisma recreates,
+# stay unreadable until then. A new column holding a credential goes on this list
+# first. The names are Prisma's: the schema has no @map or @@map.
+READONLY_ROLE=readonly
+READONLY_HIDDEN='{
+  "Integration": ["token", "refreshToken", "customInstanceDetails"],
+  "Organization": ["apiKey"],
+  "User": ["password"],
+  "GitHub": ["token"],
+  "ThirdParty": ["apiKey"],
+  "OAuthApp": ["clientSecret"],
+  "OAuthAuthorization": ["accessToken", "authorizationCode"],
+  "OAuthSelfHostedAuthorization": ["apiKey", "accessToken", "authorizationCode"],
+  "Webhooks": ["url"],
+  "mastra_channel_installations": ["data"],
+  "mastra_channel_config": ["data"],
+  "mastra_mcp_client_versions": ["servers"]
+}'
+
+# each hidden column as readonly sees it: hidden, READABLE, or gone from the schema
+READONLY_CHECK_SQL="with hidden as (
+    select j.key as tbl, c.col
+    from jsonb_each('$READONLY_HIDDEN'::jsonb) j
+    cross join lateral jsonb_array_elements_text(j.value) as c(col))
+  select h.tbl as table_name, h.col as column_name,
+    case when cl.oid is null then 'no such table'
+         when a.attnum is null then 'no such column'
+         when has_column_privilege('$READONLY_ROLE', cl.oid, a.attnum, 'SELECT') then 'READABLE'
+         else 'hidden' end as status
+  from hidden h
+  left join pg_class cl on cl.relname = h.tbl and cl.relnamespace = 'public'::regnamespace
+  left join pg_attribute a on a.attrelid = cl.oid and a.attname = h.col and a.attnum > 0 and not a.attisdropped
+  order by 1, 2"
+
+READONLY_RELATIONS="from pg_class c where c.relnamespace = 'public'::regnamespace and c.relkind in ('r', 'p', 'v', 'm', 'f')"
+
+readonly_role() {
+  local leaks writes create others
+  # the role, as the master user (rds_iam can only be granted by it)
+  admin -q <<SQL
+do \$\$ begin if not exists (select from pg_roles where rolname = '$READONLY_ROLE') then create role $READONLY_ROLE; end if; end \$\$;
+-- with rds_iam only IAM tokens sign in; no password, not even an old one
+alter role $READONLY_ROLE with login password null connection limit ${READONLY_CONNECTIONS:-5};
+grant rds_iam to $READONLY_ROLE;
+alter role $READONLY_ROLE set default_transaction_read_only = on;
+alter role $READONLY_ROLE set statement_timeout = '${READONLY_STATEMENT_TIMEOUT:-60s}';
+alter role $READONLY_ROLE set idle_in_transaction_session_timeout = '1min';
+alter role $READONLY_ROLE set lock_timeout = '5s';
+grant connect on database "$DB" to $READONLY_ROLE;
+grant usage on schema public to $READONLY_ROLE;
+-- the table grants run as their owner
+do \$\$ begin
+  if not pg_has_role(current_user, '$OWNER_ROLE', 'SET') then
+    execute format('grant %I to %I with set true', '$OWNER_ROLE', current_user);
+  end if;
+end \$\$;
+SQL
+
+  # SELECT on every table in public, minus the hidden columns; starting from no
+  # grants each time, so a column taken off the readable list loses its grant
+  dst -q <<SQL
+set role "$OWNER_ROLE";
+do \$\$
+declare
+  hidden constant jsonb := '$READONLY_HIDDEN';
+  t record;
+  cols text;
+begin
+  for t in
+    select c.oid, c.relname, c.relowner = (select oid from pg_roles where rolname = current_user) as owned
+    $READONLY_RELATIONS
+    order by c.relname
+  loop
+    if not t.owned then
+      raise notice 'skipped %: not owned by %', t.relname, current_user;
+      continue;
+    end if;
+    -- takes back the column grants too
+    execute format('revoke all on table public.%I from $READONLY_ROLE', t.relname);
+    if hidden ? t.relname then
+      select string_agg(quote_ident(a.attname), ', ' order by a.attnum) into cols
+      from pg_attribute a
+      where a.attrelid = t.oid and a.attnum > 0 and not a.attisdropped
+        and not (hidden -> t.relname) ? a.attname;
+      if cols is not null then
+        execute format('grant select (%s) on table public.%I to $READONLY_ROLE', cols, t.relname);
+      end if;
+    else
+      execute format('grant select on table public.%I to $READONLY_ROLE', t.relname);
+    end if;
+  end loop;
+end
+\$\$;
+reset role;
+SQL
+
+  echo "== hidden columns"
+  dst -c "$READONLY_CHECK_SQL"
+  leaks=$(dst -Atc "select count(*) from ($READONLY_CHECK_SQL) s where status = 'READABLE'")
+  [ "$leaks" = 0 ] || { echo "STOP: $READONLY_ROLE can read $leaks of the credential columns above" >&2; exit 1; }
+
+  echo "== tables in public as $READONLY_ROLE sees them"
+  dst -c "select
+      count(*) filter (where has_table_privilege('$READONLY_ROLE', c.oid, 'SELECT')) as readable,
+      count(*) filter (where not has_table_privilege('$READONLY_ROLE', c.oid, 'SELECT')
+                         and has_any_column_privilege('$READONLY_ROLE', c.oid, 'SELECT')) as columns_hidden,
+      count(*) filter (where not has_any_column_privilege('$READONLY_ROLE', c.oid, 'SELECT')) as unreadable
+    $READONLY_RELATIONS"
+  writes=$(dst -Atc "select count(*) $READONLY_RELATIONS
+    and (has_table_privilege('$READONLY_ROLE', c.oid, 'INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER')
+         or has_any_column_privilege('$READONLY_ROLE', c.oid, 'INSERT, UPDATE, REFERENCES'))")
+  [ "$writes" = 0 ] || { echo "STOP: $READONLY_ROLE may change $writes tables in public" >&2; exit 1; }
+  create=$(dst -Atc "select has_schema_privilege('$READONLY_ROLE', 'public', 'CREATE') or has_database_privilege('$READONLY_ROLE', current_database(), 'CREATE')")
+  [ "$create" = f ] || { echo "STOP: $READONLY_ROLE may create objects in $DB (CREATE granted to PUBLIC?)" >&2; exit 1; }
+  others=$(dst -Atc "select string_agg(n.nspname, ', ' order by n.nspname) from pg_namespace n
+    where n.nspname not in ('public', 'information_schema') and n.nspname !~ '^pg_'
+      and exists (select from pg_class c where c.relnamespace = n.oid and c.relkind in ('r', 'p', 'v', 'm', 'f'))")
+  [ -z "$others" ] || echo "not shared with $READONLY_ROLE (only public is): $others"
+
+  admin -c "select rolname, rolconnlimit as connection_limit, rolconfig as settings from pg_roles where rolname = '$READONLY_ROLE'"
+  echo "ready: in a CloudShell VPC environment, run the line terraform -chdir=environments/production output -raw db_readonly_psql prints"
 }
 
 preflight_source() {
@@ -371,7 +506,7 @@ SQL
 }
 
 case "$mode:$target" in
-  connection-limits: | temporal-password: | init: | reset:)
+  connection-limits: | temporal-password: | init: | reset: | readonly-role:)
     DB=postiz
     OWNER_ROLE=$(echo "$APP_ROLES" | awk '{print $1}')
     ;;
@@ -414,7 +549,7 @@ case "$mode" in
     ;;
   *)
     need_admin
-    [ "$mode" = connection-limits ] || need_temporal_password
+    case "$mode" in connection-limits | readonly-role) ;; *) need_temporal_password ;; esac
     ;;
 esac
 if [ -n "$ADMIN_URL" ]; then TARGET_URL=$(admin_url_for "$DB"); fi
@@ -430,6 +565,7 @@ case "$mode" in
   init) init ;;
   reset) reset ;;
   connection-limits) connection_limits ;;
+  readonly-role) readonly_role ;;
   temporal-password)
     admin -qc "alter role temporal with login password '$TEMPORAL_DB_PASSWORD'"
     echo "temporal role now uses the current secret; restart the temporal-* services"

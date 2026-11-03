@@ -158,7 +158,8 @@ modules/
 environments/production/   everything else; app-env-keys.json = env var names per service
   tests/                   offline plan test with mocked providers
 docker/                    postiz-app.Dockerfile (one image per app), postiz.Dockerfile (all-in-one, before the split), ops.Dockerfile (migration toolbox)
-scripts/                   migration, env copy, Temporal UI tunnel, test browser, ECR retag
+scripts/                   migration, env copy, Temporal UI tunnel and CLI, test browser, ECR retag
+.claude/skills/temporal/   Claude Code skill: production Temporal through scripts/temporal-cli.sh
 .github/workflows/         terraform (plan on PR, apply on main), deploy-postiz, ops-image
 docs/migration-runbook.md
 ```
@@ -255,6 +256,20 @@ behind basic auth with the user and password from `postiz/production/temporal-ui
 hostname, and `scripts/temporal-ui-tunnel.sh` opens it on http://localhost:8081
 through Session Manager (needs the [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)).
 
+**Temporal CLI:** `scripts/temporal-cli.sh workflow list --limit 5` opens a
+Session Manager tunnel through an ECS host to the frontend, runs one `temporal`
+command and closes the tunnel (about 5 s). No port opens on AWS. With no
+arguments it keeps the tunnel open on `localhost:17233`
+(`export TEMPORAL_ADDRESS=localhost:17233`), never 7233, so a local Postiz or
+dev server can't reach production. The frontend has no authorization, so the
+script runs only reads (list, describe, show, count, query and the like) unless
+`--write` comes first. That stops mistakes, it is no lock: the open tunnel
+takes any command. Needs the Session Manager plugin, the Temporal CLI
+(`brew install temporal`) and an admin sign-in, since both read-only roles deny
+Session Manager. Claude Code uses it through the project skill
+`.claude/skills/temporal` (`/temporal`), which also maps Postiz's workflows:
+types, IDs, task queues and what to check when a post didn't publish.
+
 **Google sign-in in front of the public Temporal UI:** the load balancer sends
 everyone to Google's sign-in first, and only signed-in requests reach the UI (and
 its basic auth). Nothing in the app changes. To turn it on:
@@ -310,6 +325,48 @@ region = us-east-2
 
 It is `ReadOnlyAccess` plus Terraform state, with secret values,
 `ecs:ExecuteCommand` and Session Manager denied.
+
+**Query the database (read-only):** members of the team's read-only group in
+IAM Identity Center (the account access manager entitlement to
+`postiz-team-readonly`) can run SQL on the `postiz` database from CloudShell,
+inside the VPC. Nothing opens the database to the outside: no public endpoint,
+no tunnel. They sign in as the PostgreSQL role `readonly` with a 15-minute IAM
+token, so the role has no password. It reads every table except the columns
+that hold credentials (OAuth tokens and codes, API keys, password hashes, OAuth
+client secrets, webhook URLs, Mastra's chat-platform and MCP configs). On those
+few tables `SELECT *` fails, so name the columns. Transactions are read-only,
+statements stop after 60 seconds, and the role gets 5 connections. The team
+role also can't download the RDS log files, which hold slow statements with
+their parameters.
+
+1. Sign in through the access portal with the read-only access, switch to
+   us-east-2 and open **CloudShell**.
+2. **Actions > Create VPC environment**: VPC `postiz-production`, one of its
+   private subnets, security group `postiz-production-db-readers`. Any other
+   choice is refused.
+3. Connect, with the endpoint from the RDS console (`postiz-production-main` >
+   Connectivity & security). `terraform output -raw db_readonly_psql` prints
+   this line filled in.
+
+   ```bash
+   H=<endpoint>
+   PGPASSWORD="$(aws rds generate-db-auth-token --region us-east-2 --hostname $H --port 5432 --username readonly)" \
+     psql "host=$H port=5432 dbname=postiz user=readonly sslmode=require"
+   ```
+
+The environment reaches the database but not the internet, and CloudShell
+deletes it after 20 to 30 idle minutes; create it again the same way. The
+columns a restricted table shows:
+`select column_name from information_schema.column_privileges where grantee = 'readonly' and table_name = 'Integration';`
+
+Setup and upkeep: `migrate-postgres.sh readonly-role` in the ops task (runbook
+B1) creates the role and its grants. Run it again after a schema change: new
+tables, and columns Prisma recreates, stay unreadable until then. A new column
+that holds a credential goes on the script's `READONLY_HIDDEN` list first. IAM
+sign-in is on in Terraform, but on an existing instance it waits for the
+maintenance window; `aws rds modify-db-instance --db-instance-identifier postiz-production-main --enable-iam-database-authentication --apply-immediately`
+turns it on now, without downtime. To give someone access, create their
+Identity Center user and add them to the read-only group.
 
 ## Running your own
 

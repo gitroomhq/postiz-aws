@@ -282,3 +282,17 @@ run "temporal_ui_public_needs_a_domain" {
 
   expect_failures = [var.temporal_ui_domain]
 }
+
+run "team_database_access" {
+  command = plan
+
+  assert {
+    condition     = aws_iam_role_policy.team_db_query.role == "postiz-team-readonly"
+    error_message = "the team's read-only role gets CloudShell inside the VPC and the readonly database sign-in"
+  }
+
+  assert {
+    condition     = aws_vpc_security_group_egress_rule.db_readers_postgres.from_port == 5432 && aws_vpc_security_group_egress_rule.db_readers_postgres.to_port == 5432
+    error_message = "the team's CloudShell environments reach PostgreSQL and nothing else"
+  }
+}

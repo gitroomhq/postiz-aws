@@ -309,6 +309,8 @@ resource "aws_iam_role_policy" "agent_extra" {
 # Assigned to IAM Identity Center users through account access manager (an
 # entitlement in the management account), the same way AccountFullAccessRole is.
 # Members sign in through the account access portal or with `aws login`.
+# environments/production adds the inline policy query-database-readonly
+# (db-readers.tf): CloudShell inside the VPC and the database's readonly sign-in.
 
 data "aws_iam_policy_document" "team_trust" {
   statement {

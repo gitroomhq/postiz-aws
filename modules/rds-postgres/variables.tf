@@ -55,6 +55,17 @@ variable "allowed_security_group_ids" {
   type        = map(string)
 }
 
+variable "iam_database_authentication" {
+  description = <<-EOT
+    Let roles granted rds_iam sign in with a 15-minute IAM token instead of a
+    password; other roles keep their passwords. No downtime, but with
+    apply_immediately off it waits for the maintenance window: run
+    `aws rds modify-db-instance --enable-iam-database-authentication --apply-immediately` first.
+  EOT
+  type        = bool
+  default     = false
+}
+
 variable "parameters" {
   type = map(object({
     value        = string

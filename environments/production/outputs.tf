@@ -22,6 +22,20 @@ output "main_db_address" {
   value = module.postgres_main.address
 }
 
+output "db_readonly_cloudshell" {
+  description = "Choices for the CloudShell VPC environment the team queries from (README: Query the database)"
+  value = {
+    vpc            = module.network.vpc_id
+    subnets        = module.network.private_subnet_ids
+    security_group = aws_security_group.db_readers.id
+  }
+}
+
+output "db_readonly_psql" {
+  description = "Paste into that CloudShell VPC environment: psql as readonly, signed in with an IAM token"
+  value       = "PGPASSWORD=\"$(aws rds generate-db-auth-token --region ${var.region} --hostname ${module.postgres_main.address} --port ${module.postgres_main.port} --username ${local.db_reader_role})\" psql \"host=${module.postgres_main.address} port=${module.postgres_main.port} dbname=postiz user=${local.db_reader_role} sslmode=require\""
+}
+
 output "redis_primary_endpoint" {
   value = aws_elasticache_replication_group.redis.primary_endpoint_address
 }

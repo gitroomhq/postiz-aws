@@ -61,6 +61,8 @@ resource "aws_db_instance" "this" {
   password_wo         = ephemeral.random_password.admin.result
   password_wo_version = var.password_version
 
+  iam_database_authentication_enabled = var.iam_database_authentication
+
   allocated_storage     = var.allocated_storage
   max_allocated_storage = var.max_allocated_storage
   storage_type          = "gp3"
