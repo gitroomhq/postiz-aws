@@ -12,6 +12,9 @@ workers_enabled  = true
 maintenance_mode = false
 dns_cutover      = true
 
+# App email through Amazon SES instead of Resend (ses.tf); false switches back
+ses_sending_enabled = true
+
 cloudflare_zone_name = "postiz.com"
 api_domain           = "api.postiz.com"
 mcp_domain           = "mcp.postiz.com"
