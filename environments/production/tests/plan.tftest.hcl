@@ -36,6 +36,11 @@ mock_provider "aws" {
   mock_data "aws_cloudfront_origin_request_policy" {
     defaults = { id = "216adef6-5c7f-47e4-b989-5492eafa07d3" }
   }
+  # known at plan time, so the services' target groups can be checked
+  mock_resource "aws_lb_target_group" {
+    override_during = plan
+    defaults        = { arn = "arn:aws:elasticloadbalancing:us-east-2:123456789012:targetgroup/postiz-production-app/0123456789abcdef" }
+  }
   # the real provider knows domain_validation_options[*].domain_name at plan time
   mock_resource "aws_acm_certificate" {
     override_during = plan
@@ -220,6 +225,11 @@ run "temporal_ui_google_login" {
   assert {
     condition     = alltrue([for k, r in aws_lb_listener_rule.app : length(r.action) == 1 if k != "temporal-ui"])
     error_message = "api, mcp and platform get no sign-in step"
+  }
+
+  assert {
+    condition     = alltrue([for k, tg in aws_lb_target_group.app : local.alb_target_group_arns[k] == tg.arn])
+    error_message = "each service takes its rule's forward target group, not the sign-in step's (which has none)"
   }
 
   assert {

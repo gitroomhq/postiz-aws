@@ -135,8 +135,8 @@ module "postiz" {
   # the workers publish posts, so they also wait for workers_enabled (go-live)
   desired_count = var.apps_enabled && (var.workers_enabled || !each.value.publishes) ? each.value.desired : 0
   autoscaling   = each.value.autoscaling
-  # read through the listener rule: ECS refuses a target group that is not on a load balancer yet
-  target_group_arn = each.value.target_group == null ? null : aws_lb_listener_rule.app[each.value.target_group].action[0].target_group_arn
+  # read through the listener rule (alb.tf): ECS refuses a target group that is not on a load balancer yet
+  target_group_arn = each.value.target_group == null ? null : local.alb_target_group_arns[each.value.target_group]
 
   log_retention_days = var.log_retention_days
 }

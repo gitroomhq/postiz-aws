@@ -282,6 +282,16 @@ resource "aws_lb_listener_rule" "app" {
   depends_on = [aws_vpc_security_group_egress_rule.alb_to_idp]
 }
 
+# The target group each service uses, read through its rule: ECS refuses a target
+# group that is not on a load balancer yet. Picked by type, not position: with
+# Google sign-in the Temporal UI's first action is authenticate-oidc, whose
+# target_group_arn reads back empty.
+locals {
+  alb_target_group_arns = {
+    for k, rule in aws_lb_listener_rule.app : k => one([for a in rule.action : a.target_group_arn if a.type == "forward"])
+  }
+}
+
 # --- maintenance mode -------------------------------------------------------------------
 # maintenance_mode = true answers every request to api, mcp and platform with a 503
 # (JSON for the API, a page for the app); stopped clients and webhooks such as

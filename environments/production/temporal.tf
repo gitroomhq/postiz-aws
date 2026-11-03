@@ -215,7 +215,7 @@ module "temporal_ui" {
     ]
   }]
 
-  target_group_arn  = var.temporal_ui_public ? aws_lb_listener_rule.app["temporal-ui"].action[0].target_group_arn : null
+  target_group_arn  = var.temporal_ui_public ? local.alb_target_group_arns["temporal-ui"] : null
   lb_container_name = "basic-auth"
   lb_container_port = 8081
   desired_count     = var.apps_enabled ? 1 : 0
