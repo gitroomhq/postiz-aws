@@ -35,6 +35,7 @@ locals {
       target_group = "backend"
       temporal     = true
       redis        = true
+      email        = true
       health_check = null
       publishes    = false
     }
@@ -54,6 +55,7 @@ locals {
       target_group = "mcp"
       temporal     = true
       redis        = true
+      email        = true
       health_check = null
       publishes    = false
     }
@@ -68,6 +70,7 @@ locals {
       target_group = "frontend"
       temporal     = false
       redis        = false
+      email        = false
       health_check = null
       publishes    = false
     }
@@ -82,6 +85,7 @@ locals {
       target_group = null
       temporal     = true
       redis        = true
+      email        = true
       health_check = local.worker_health_check
       publishes    = true
     }
@@ -97,6 +101,7 @@ locals {
       target_group = null
       temporal     = true
       redis        = true
+      email        = true
       health_check = local.worker_health_check
       publishes    = true
     }
@@ -125,11 +130,20 @@ module "postiz" {
     # the frontend's standalone server reads PORT too (and binds 0.0.0.0: the image sets HOSTNAME)
     each.value.port != null ? { PORT = tostring(each.value.port) } : {},
     each.value.temporal ? { TEMPORAL_ADDRESS = local.temporal_address } : {},
+    # SES through the task role (ses.tf); EMAIL_PROVIDER from the secret (Railway's) until switched
+    each.value.email ? { SES_REGION = var.region } : {},
+    each.value.email && var.ses_sending_enabled ? { EMAIL_PROVIDER = "ses" } : {},
   )
   secrets = merge(
-    local.app_secrets[each.key],
+    # a name may not be both an environment variable and a secret
+    {
+      for k, v in local.app_secrets[each.key] : k => v
+      if !(k == "EMAIL_PROVIDER" && each.value.email && var.ses_sending_enabled)
+    },
     each.value.redis ? local.redis_url_secret : {},
   )
+
+  task_role_policy_json = each.value.email ? data.aws_iam_policy_document.ses_send.json : null
 
   health_check = each.value.health_check
   # the workers publish posts, so they also wait for workers_enabled (go-live)

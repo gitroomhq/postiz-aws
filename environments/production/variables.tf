@@ -71,6 +71,16 @@ variable "maintenance_mode" {
   default     = false
 }
 
+variable "ses_sending_enabled" {
+  description = <<-EOT
+    true sets EMAIL_PROVIDER=ses on backend, mcp, worker and worker-2, in place of
+    the value in their secrets (Railway's, Resend). Turn it on only once the SES
+    identity's DKIM is verified and the account has production access (ses.tf).
+  EOT
+  type        = bool
+  default     = false
+}
+
 variable "dns_cutover" {
   description = "Point api, mcp and platform at AWS. Delete the old Railway records in Cloudflare first."
   type        = bool

@@ -306,3 +306,30 @@ run "team_database_access" {
     error_message = "the team's CloudShell environments reach PostgreSQL and nothing else"
   }
 }
+
+run "ses" {
+  command = plan
+
+  assert {
+    condition     = aws_sesv2_email_identity.domain.email_identity == "postiz.com" && length(cloudflare_dns_record.ses_dkim) == 3
+    error_message = "SES sends as the postiz.com domain, signed with Easy DKIM (three CNAMEs)"
+  }
+
+  assert {
+    condition     = aws_sesv2_email_identity_mail_from_attributes.domain.mail_from_domain == "ses-mail.postiz.com" && cloudflare_dns_record.ses_mail_from_mx.content == "feedback-smtp.us-east-2.amazonses.com"
+    error_message = "the MAIL FROM is its own subdomain (send.postiz.com is Resend's) with an MX in the sending region"
+  }
+}
+
+run "ses_sending_enabled" {
+  command = plan
+
+  variables {
+    ses_sending_enabled = true
+  }
+
+  assert {
+    condition     = length(module.postiz) == 5
+    error_message = "switching EMAIL_PROVIDER to ses still plans every Postiz service"
+  }
+}

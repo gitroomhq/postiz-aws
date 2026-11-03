@@ -47,6 +47,7 @@ Cloudflare R2 (media) and RunPod (media processing) stay where they are.
 | Elasticsearch (8.19.10) | Same version on one EC2 host with a separate EBS volume |
 | Temporal UI + Basic Auth | temporalio/ui 2.39.0 + Caddy basic auth with the same user and password, on a random unlisted hostname like Railway's generated URL |
 | Railway variables | Secrets Manager, one JSON secret per service |
+| Resend (email) | Amazon SES in us-east-2 as postiz.com, sent with each service's task role ([ses.tf](environments/production/ses.tf)); `ses_sending_enabled` switches backend, mcp and the workers over |
 | Railway auto-deploy + pre-deploy `prisma db push` | Push to postiz-app main -> `deploy-postiz` workflow: build, db push task, roll services |
 
 ### Decisions worth knowing
