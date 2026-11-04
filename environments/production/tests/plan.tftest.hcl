@@ -263,6 +263,8 @@ run "temporal_ui_google_login_needs_the_secret" {
 
   variables {
     temporal_ui_google_client_id = "1234567890-abc.apps.googleusercontent.com"
+    # CI exports TF_VAR_temporal_ui_google_client_secret; this run needs it unset
+    temporal_ui_google_client_secret = ""
   }
 
   expect_failures = [var.temporal_ui_google_client_secret]
