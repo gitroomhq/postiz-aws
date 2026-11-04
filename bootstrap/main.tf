@@ -342,6 +342,13 @@ resource "aws_iam_role_policy_attachment" "team_readonly_amazon_q" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonQDeveloperAccess"
 }
 
+# `aws login` (console credentials for the CLI) needs signin OAuth2 actions that
+# ReadOnlyAccess doesn't include; without them the browser approval step fails.
+resource "aws_iam_role_policy_attachment" "team_readonly_cli_login" {
+  role       = aws_iam_role.team_readonly.name
+  policy_arn = "arn:aws:iam::aws:policy/SignInLocalDevelopmentAccess"
+}
+
 data "aws_iam_policy_document" "no_secret_values" {
   statement {
     sid    = "NoSecretValues"
