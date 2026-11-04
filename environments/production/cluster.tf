@@ -8,7 +8,9 @@ module "ecs_cluster" {
   instance_type         = var.ecs_instance_type
   min_size              = var.ecs_min_instances
   max_size              = var.ecs_max_instances
-  tags                  = local.tags
+  # small internal apps (other Terraform roots) run on Fargate, not on these hosts
+  enable_fargate = true
+  tags           = local.tags
 }
 
 # --- images --------------------------------------------------------------------------

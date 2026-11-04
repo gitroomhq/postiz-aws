@@ -263,6 +263,8 @@ run "temporal_ui_google_login_needs_the_secret" {
 
   variables {
     temporal_ui_google_client_id = "1234567890-abc.apps.googleusercontent.com"
+    # CI exports TF_VAR_temporal_ui_google_client_secret; this run needs it unset
+    temporal_ui_google_client_secret = ""
   }
 
   expect_failures = [var.temporal_ui_google_client_secret]
@@ -402,5 +404,21 @@ run "team_tunnels" {
   assert {
     condition     = module.temporal_readonly.service_name == "temporal-readonly"
     error_message = "the read-only proxy runs as its own service"
+  }
+}
+
+run "fargate_for_other_apps" {
+  command = plan
+
+  assert {
+    condition     = contains(module.ecs_cluster.capacity_providers, "FARGATE") && module.ecs_cluster.capacity_provider_name == "postiz-production-ec2"
+    error_message = "the cluster offers FARGATE to other apps while Postiz keeps the EC2 provider as the default"
+  }
+
+  assert {
+    condition = toset(one([for st in data.aws_iam_policy_document.deploy.statement : st.resources if st.sid == "RollServices"])) == toset([
+      for s in ["backend", "frontend", "mcp", "worker", "worker-2"] : "arn:aws:ecs:us-east-2:123456789012:service/postiz-production/${s}"
+    ])
+    error_message = "the Postiz deploy role restarts only the Postiz services, not other apps in the cluster"
   }
 }
