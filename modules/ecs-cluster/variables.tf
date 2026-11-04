@@ -41,6 +41,12 @@ variable "max_instance_lifetime_days" {
   default = 14
 }
 
+variable "enable_fargate" {
+  description = "Add the FARGATE capacity provider, for services that run with launch_type = fargate."
+  type        = bool
+  default     = false
+}
+
 variable "container_insights" {
   type    = string
   default = "enabled"

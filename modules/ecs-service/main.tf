@@ -5,6 +5,10 @@
 #              host's public IP (internet-facing app containers).
 # awsvpc mode: own ENI in a private subnet, ALB targets are IPs, discoverable
 #              through Cloud Map A records (internal-only containers).
+# fargate:     awsvpc on FARGATE instead of the EC2 hosts (small internal apps).
+#              The VPC has no NAT gateway, so a task that calls the internet runs
+#              in a public subnet with assign_public_ip = true, inbound closed by
+#              its security group.
 
 data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
@@ -13,6 +17,7 @@ locals {
   family    = "${var.cluster_name}-${var.name}"
   log_group = "/ecs/${var.cluster_name}/${var.name}"
   awsvpc    = var.network_mode == "awsvpc"
+  fargate   = var.launch_type == "fargate"
 
   log_configuration = {
     logDriver = "awslogs"
@@ -132,10 +137,25 @@ resource "aws_iam_role_policy" "extra" {
 resource "aws_ecs_task_definition" "this" {
   family                   = local.family
   network_mode             = var.network_mode
-  requires_compatibilities = ["EC2"]
+  requires_compatibilities = [local.fargate ? "FARGATE" : "EC2"]
   execution_role_arn       = var.execution_role_arn
   task_role_arn            = aws_iam_role.task.arn
   container_definitions    = jsonencode(local.containers)
+
+  # Fargate bills the task size, which must be a valid pair (256 CPU: 512-2048 MiB, ...)
+  cpu    = local.fargate ? tostring(var.cpu) : null
+  memory = local.fargate ? tostring(var.memory) : null
+
+  lifecycle {
+    precondition {
+      condition     = !local.fargate || (local.awsvpc && length(var.host_volumes) == 0)
+      error_message = "Fargate needs network_mode = \"awsvpc\" and no host_volumes."
+    }
+    precondition {
+      condition     = local.fargate || var.capacity_provider_name != null
+      error_message = "The ec2 launch type needs capacity_provider_name."
+    }
+  }
 
   runtime_platform {
     cpu_architecture        = "ARM64"
@@ -169,7 +189,7 @@ resource "aws_ecs_service" "this" {
   health_check_grace_period_seconds  = var.target_group_arn == null ? null : var.health_check_grace_period
 
   capacity_provider_strategy {
-    capacity_provider = var.capacity_provider_name
+    capacity_provider = local.fargate ? "FARGATE" : var.capacity_provider_name
     weight            = 1
   }
 
@@ -178,14 +198,13 @@ resource "aws_ecs_service" "this" {
     rollback = true
   }
 
-  ordered_placement_strategy {
-    type  = "spread"
-    field = "attribute:ecs.availability-zone"
-  }
-
-  ordered_placement_strategy {
-    type  = "spread"
-    field = "instanceId"
+  # Fargate spreads tasks across AZs on its own and rejects placement strategies
+  dynamic "ordered_placement_strategy" {
+    for_each = local.fargate ? [] : ["attribute:ecs.availability-zone", "instanceId"]
+    content {
+      type  = "spread"
+      field = ordered_placement_strategy.value
+    }
   }
 
   dynamic "network_configuration" {
@@ -193,7 +212,7 @@ resource "aws_ecs_service" "this" {
     content {
       subnets          = var.subnet_ids
       security_groups  = var.security_group_ids
-      assign_public_ip = false
+      assign_public_ip = var.assign_public_ip
     }
   }
 

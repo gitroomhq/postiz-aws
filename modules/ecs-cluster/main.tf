@@ -220,8 +220,10 @@ resource "aws_ecs_capacity_provider" "this" {
 }
 
 resource "aws_ecs_cluster_capacity_providers" "this" {
-  cluster_name       = aws_ecs_cluster.this.name
-  capacity_providers = [aws_ecs_capacity_provider.this.name]
+  cluster_name = aws_ecs_cluster.this.name
+  # FARGATE only becomes available to services that ask for it; the default stays EC2.
+  # This resource owns the whole list, so other Terraform roots must not set it.
+  capacity_providers = concat([aws_ecs_capacity_provider.this.name], var.enable_fargate ? ["FARGATE"] : [])
 
   default_capacity_provider_strategy {
     capacity_provider = aws_ecs_capacity_provider.this.name

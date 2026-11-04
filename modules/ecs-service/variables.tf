@@ -11,8 +11,27 @@ variable "cluster_arn" {
   type = string
 }
 
+variable "launch_type" {
+  description = "ec2: the cluster's EC2 capacity provider. fargate: FARGATE (ARM64), needs network_mode awsvpc and no host_volumes; cpu and memory are then also the task size."
+  type        = string
+  default     = "ec2"
+
+  validation {
+    condition     = contains(["ec2", "fargate"], var.launch_type)
+    error_message = "launch_type must be ec2 or fargate."
+  }
+}
+
 variable "capacity_provider_name" {
-  type = string
+  description = "EC2 capacity provider, ec2 launch type only."
+  type        = string
+  default     = null
+}
+
+variable "assign_public_ip" {
+  description = "awsvpc only. Fargate tasks in the public subnets need it for egress: the VPC has no NAT gateway."
+  type        = bool
+  default     = false
 }
 
 variable "execution_role_arn" {

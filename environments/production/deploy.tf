@@ -60,10 +60,11 @@ data "aws_iam_policy_document" "deploy" {
     resources = [aws_ecr_repository.app.arn, aws_ecr_repository.ops.arn]
   }
 
+  # Only the Postiz services: other apps in the cluster have their own deploy roles.
   statement {
     sid       = "RollServices"
     actions   = ["ecs:UpdateService", "ecs:DescribeServices"]
-    resources = ["${local.cluster_arn_prefix}:service/${module.ecs_cluster.cluster_name}/*"]
+    resources = [for s in sort(keys(local.postiz_services)) : "${local.cluster_arn_prefix}:service/${module.ecs_cluster.cluster_name}/${s}"]
   }
 
   statement {
