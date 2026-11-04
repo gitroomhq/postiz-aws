@@ -29,6 +29,7 @@ Cloudflare R2 (media) and RunPod (media processing) stay where they are.
    awsvpc mode, private subnets, Cloud Map postiz.internal:
      temporal-frontend x2 . temporal-history x2 . temporal-matching x2 . temporal-worker
      temporal-ui + Caddy basic auth (public, on an unlisted hostname like Railway's)
+     temporal-readonly: Caddy passing only read calls (the CLI tunnel's reads)
         |                         |                         |
         v                         v                         v
   RDS PostgreSQL 16          ElastiCache Valkey        Elasticsearch 8.19.10
@@ -258,18 +259,27 @@ hostname, and `scripts/temporal-ui-tunnel.sh` opens it on http://localhost:8081
 through Session Manager (needs the [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)).
 
 **Temporal CLI:** `scripts/temporal-cli.sh workflow list --limit 5` opens a
-Session Manager tunnel through an ECS host to the frontend, runs one `temporal`
-command and closes the tunnel (about 5 s). No port opens on AWS. With no
-arguments it keeps the tunnel open on `localhost:17233`
-(`export TEMPORAL_ADDRESS=localhost:17233`), never 7233, so a local Postiz or
-dev server can't reach production. The frontend has no authorization, so the
-script runs only reads (list, describe, show, count, query and the like) unless
-`--write` comes first. That stops mistakes, it is no lock: the open tunnel
-takes any command. Needs the Session Manager plugin, the Temporal CLI
-(`brew install temporal`) and an admin sign-in, since both read-only roles deny
-Session Manager. Claude Code uses it through the project skill
-`.claude/skills/temporal` (`/temporal`), which also maps Postiz's workflows:
-types, IDs, task queues and what to check when a post didn't publish.
+Session Manager tunnel through an ECS host, runs one `temporal` command and
+closes the tunnel (about 5 s). No port opens on AWS. With no arguments it keeps
+the tunnel open on `localhost:17233` (`export TEMPORAL_ADDRESS=localhost:17233`),
+never 7233, so a local Postiz or dev server can't reach production.
+
+The frontend has no authorization, so reads go to the read-only proxy
+`temporal-readonly.postiz.internal:7233` instead
+([temporal-readonly.tf](environments/production/temporal-readonly.tf)): Caddy
+passes an exact list of read calls (list, describe, get, count, query, health)
+and answers anything else with 403 (Forbidden), whatever client connects. Its
+access log records every call, refused ones included. The tunnel uses the
+Session Manager document `postiz-team-temporal-readonly`, which fixes the host
+and port, so the team's read-only role (postiz-team-readonly) can use it too:
+bootstrap/ denies that role every other session document, the shell included.
+`--write` tunnels straight to the frontend for any command and needs an admin
+sign-in. The script also refuses non-read commands before connecting unless
+`--write` comes first. Needs the Session Manager plugin and the Temporal CLI
+(`brew install temporal`); postiz-agent-readonly denies Session Manager.
+Claude Code uses it through the project skill `.claude/skills/temporal`
+(`/temporal`), which also maps Postiz's workflows: types, IDs, task queues and
+what to check when a post didn't publish.
 
 **Google sign-in in front of the public Temporal UI:** the load balancer sends
 everyone to Google's sign-in first, and only signed-in requests reach the UI (and

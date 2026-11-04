@@ -309,8 +309,10 @@ resource "aws_iam_role_policy" "agent_extra" {
 # Assigned to IAM Identity Center users through account access manager (an
 # entitlement in the management account), the same way AccountFullAccessRole is.
 # Members sign in through the account access portal or with `aws login`.
-# environments/production adds the inline policy query-database-readonly
-# (db-readers.tf): CloudShell inside the VPC and the database's readonly sign-in.
+# environments/production adds the inline policies query-database-readonly
+# (db-readers.tf): CloudShell inside the VPC and the database's readonly sign-in;
+# and temporal-readonly-tunnel (temporal-readonly.tf): a Session Manager tunnel to
+# the read-only Temporal proxy.
 
 data "aws_iam_policy_document" "team_trust" {
   statement {
@@ -360,9 +362,26 @@ data "aws_iam_policy_document" "no_secret_values" {
       "ssm:GetParameters",
       "ssm:GetParametersByPath",
       "ecs:ExecuteCommand",
-      "ssm:StartSession",
     ]
     resources = ["*"]
+  }
+
+  # Session Manager only with the team's own session documents, postiz-team-*,
+  # which environments/production creates with host and port fixed inside (the
+  # read-only Temporal tunnel, temporal-readonly.tf). Every other document is
+  # denied: the default shell (SSM-SessionManagerRunShell, which a session without
+  # --document-name uses), AWS-StartPortForwardingSession*, interactive commands.
+  # So are ECS task targets. Instances are left to the allow in
+  # environments/production, which names only the ECS hosts. The agent role above
+  # still denies Session Manager entirely.
+  statement {
+    sid     = "SessionManagerOnlyTeamDocuments"
+    effect  = "Deny"
+    actions = ["ssm:StartSession"]
+    not_resources = [
+      "arn:aws:ssm:${var.region}:${var.aws_account_id}:document/postiz-team-*",
+      "arn:aws:ec2:${var.region}:${var.aws_account_id}:instance/*",
+    ]
   }
 }
 

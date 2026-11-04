@@ -338,3 +338,45 @@ run "ses_sending_enabled" {
     error_message = "switching EMAIL_PROVIDER to ses still plans every Postiz service"
   }
 }
+
+run "temporal_readonly" {
+  command = plan
+
+  variables {
+    apps_enabled = true
+  }
+
+  assert {
+    condition = (
+      jsondecode(aws_ssm_document.temporal_readonly_tunnel.content).properties.host == "temporal-readonly.postiz.internal" &&
+      jsondecode(aws_ssm_document.temporal_readonly_tunnel.content).properties.portNumber == "7233" &&
+      keys(jsondecode(aws_ssm_document.temporal_readonly_tunnel.content).parameters) == ["localPortNumber"]
+    )
+    error_message = "the team's tunnel reaches the read-only proxy only: host and port are fixed in the document, the local port is its only parameter"
+  }
+
+  assert {
+    condition     = startswith(aws_ssm_document.temporal_readonly_tunnel.name, "postiz-team-")
+    error_message = "bootstrap/ lets the team use only session documents named postiz-team-*"
+  }
+
+  assert {
+    condition = alltrue([
+      for p in local.temporal_readonly_paths : can(regex(
+        "^/(temporal\\.api\\.(workflowservice\\.v1\\.WorkflowService|operatorservice\\.v1\\.OperatorService)/(List|Describe|Get|Count|Scan)[A-Za-z]+|temporal\\.api\\.workflowservice\\.v1\\.WorkflowService/(QueryWorkflow|PollWorkflowExecutionUpdate)|grpc\\.health\\.v1\\.Health/Check)$",
+        p
+      ))
+    ])
+    error_message = "the read-only proxy may pass only read calls (List, Describe, Get, Count, Scan, QueryWorkflow, PollWorkflowExecutionUpdate, health)"
+  }
+
+  assert {
+    condition     = !anytrue([for p in local.temporal_readonly_paths : can(regex("TaskQueue$|AdminService", p)) && !can(regex("/(Describe|ListTaskQueuePartitions)", p))])
+    error_message = "no worker polls (Poll*TaskQueue would take tasks from real workers) and nothing from AdminService"
+  }
+
+  assert {
+    condition     = module.temporal_readonly.service_name == "temporal-readonly"
+    error_message = "the read-only proxy runs as its own service"
+  }
+}

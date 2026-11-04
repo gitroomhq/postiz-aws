@@ -1,25 +1,32 @@
 #!/bin/bash
 # The Temporal CLI against production, with no port open on AWS: Session Manager
-# forwards a port on this machine, through one of the ECS hosts, to the Temporal
-# frontend (temporal-frontend.postiz.internal:7233).
+# forwards a port on this machine, through one of the ECS hosts, into the VPC.
 #
 #   scripts/temporal-cli.sh workflow list --limit 5   opens a tunnel, runs one command, closes it
-#   scripts/temporal-cli.sh                           keeps a tunnel open on localhost:17233 for
-#                                                     any temporal command (Ctrl-C closes it)
+#   scripts/temporal-cli.sh                           keeps a read-only tunnel open on
+#                                                     localhost:17233 (Ctrl-C closes it)
 #   scripts/temporal-cli.sh --write workflow terminate -w <id> --reason "..."
+#   scripts/temporal-cli.sh --write                   keeps a tunnel open for any command
 #
-# The frontend has no authorization: whoever reaches it can terminate, reset or
-# delete any workflow. So a command given here must be one of the reads below
-# unless --write comes first. That catches mistakes, it is no lock: the open
-# tunnel takes anything.
+# Reads go to the read-only proxy (temporal-readonly.postiz.internal:7233, see
+# environments/production/temporal-readonly.tf), through the Session Manager
+# document postiz-team-temporal-readonly, whose host and port are fixed. The proxy
+# passes only read calls and answers anything else with 403 (Forbidden), whoever
+# asks. This works with AccountFullAccessRole and with postiz-team-readonly.
+#
+# --write tunnels straight to the frontend (temporal-frontend.postiz.internal:7233),
+# which has no authorization: whoever reaches it can terminate, reset or delete any
+# workflow. Only an admin sign-in (AccountFullAccessRole) may open that tunnel.
+# A command given here must also be one of the reads below unless --write comes
+# first; that catches mistakes before the proxy refuses them.
 # Local port 17233, not 7233: a Postiz or `temporal server start-dev` running on
 # this machine must never reach production by accident.
-# Needs the AWS CLI signed in with Session Manager access (AccountFullAccessRole;
-# postiz-team-readonly and postiz-agent-readonly deny it), the Session Manager
-# plugin and the Temporal CLI (brew install temporal).
+# Needs the AWS CLI signed in (aws login), the Session Manager plugin and the
+# Temporal CLI (brew install temporal). postiz-agent-readonly denies Session Manager.
 set -euo pipefail
 CLUSTER=${CLUSTER:-postiz-production}
 FRONTEND=temporal-frontend.postiz.internal
+READONLY_DOCUMENT=postiz-team-temporal-readonly
 
 write=false
 if [ "${1:-}" = --write ]; then
@@ -69,20 +76,41 @@ fi
 # shellcheck disable=SC2086 # one argument per ARN
 instance=$(aws ecs describe-container-instances --cluster "$CLUSTER" --container-instances $hosts \
   --query 'containerInstances[?agentConnected].ec2InstanceId | [0]' --output text)
-session=(aws ssm start-session --target "$instance" --document-name AWS-StartPortForwardingSessionToRemoteHost)
+if [ "$write" = true ]; then
+  # straight to the frontend: every command, admin sign-in only
+  session=(aws ssm start-session --target "$instance" --document-name AWS-StartPortForwardingSessionToRemoteHost)
+  forward() { echo "host=$FRONTEND,portNumber=7233,localPortNumber=$1"; }
+  what="Temporal frontend, every command allowed"
+else
+  # the read-only proxy: the document fixes host and port, only the local port is ours
+  session=(aws ssm start-session --target "$instance" --document-name "$READONLY_DOCUMENT")
+  forward() { echo "localPortNumber=$1"; }
+  what="Temporal through the read-only proxy, reads only"
+fi
+
+hint() { # why a tunnel or a command failed, from its output
+  if grep -q 'AccessDenied' "$1" && [ "$write" = true ]; then
+    echo "temporal-cli.sh: --write tunnels straight to the frontend and needs an admin sign-in (AccountFullAccessRole). Reads work without --write." >&2
+  elif grep -q 'AccessDenied' "$1"; then
+    echo "temporal-cli.sh: this sign-in may not open the read-only tunnel (postiz-team-readonly or AccountFullAccessRole can)." >&2
+  elif grep -q '403 (Forbidden)' "$1"; then
+    echo "temporal-cli.sh: the read-only proxy refused that call: it passes reads only. Changes need --write and an admin sign-in." >&2
+  fi
+}
 
 if [ $# -eq 0 ]; then
   port=${LOCAL_PORT:-17233}
-  echo "Temporal frontend on localhost:$port, every command allowed (Ctrl-C closes the tunnel). In another terminal:" >&2
+  echo "$what, on localhost:$port (Ctrl-C closes the tunnel). In another terminal:" >&2
   echo "  export TEMPORAL_ADDRESS=localhost:$port" >&2
-  exec "${session[@]}" --parameters "host=$FRONTEND,portNumber=7233,localPortNumber=$port"
+  exec "${session[@]}" --parameters "$(forward "$port")"
 fi
 
 # a random port, so that several commands can run at once
 port=${LOCAL_PORT:-$((20000 + RANDOM % 20000))}
 log=$(mktemp)
+out=$(mktemp)
 set -m # its own process group: the cleanup reaches the Session Manager plugin under the AWS CLI
-"${session[@]}" --parameters "host=$FRONTEND,portNumber=7233,localPortNumber=$port" </dev/null >"$log" 2>&1 &
+"${session[@]}" --parameters "$(forward "$port")" </dev/null >"$log" 2>&1 &
 pid=$!
 set +m
 close() {
@@ -92,7 +120,7 @@ close() {
     sleep 0.3
   done
   kill -TERM -- "-$pid" 2>/dev/null || true
-  rm -f "$log"
+  rm -f "$log" "$out"
 }
 trap close EXIT
 trap 'exit 130' INT
@@ -100,11 +128,16 @@ trap 'exit 143' TERM
 
 for _ in $(seq 150); do # 30 s
   if grep -q 'Waiting for connections' "$log"; then
-    TEMPORAL_ADDRESS=localhost:$port temporal "$@"
-    exit
+    # stdout untouched; stderr passes through as it comes, and a copy tells the
+    # hint what happened (a pipe, not >(...): macOS runs this with bash 3.2)
+    rc=0
+    { TEMPORAL_ADDRESS=localhost:$port temporal "$@" 2>&1 1>&3 3>&- | tee "$out" 1>&2 3>&-; } 3>&1 || rc=$?
+    [ "$rc" -eq 0 ] || hint "$out"
+    exit "$rc"
   fi
   if ! kill -0 "$pid" 2>/dev/null; then
     cat "$log" >&2
+    hint "$log"
     exit 1
   fi
   sleep 0.2

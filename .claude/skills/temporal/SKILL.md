@@ -1,6 +1,6 @@
 ---
 name: temporal
-description: Query production Temporal, where every scheduled Postiz post is a workflow, through scripts/temporal-cli.sh (a Session Manager tunnel, no open port). Use for a post that didn't publish or published twice, stuck or failing workflows, workflow history, task-queue backlog or workers, and Temporal health. Read commands only; any change to Temporal needs the user's OK first.
+description: Query production Temporal, where every scheduled Postiz post is a workflow, through scripts/temporal-cli.sh (a Session Manager tunnel to a read-only proxy, no open port). Use for a post that didn't publish or published twice, stuck or failing workflows, workflow history, task-queue backlog or workers, and Temporal health. Read commands only; any change to Temporal needs the user's OK first.
 argument-hint: "[question, post ID or workflow ID]"
 allowed-tools:
   - Bash(scripts/temporal-cli.sh workflow *)
@@ -16,11 +16,13 @@ allowed-tools:
 ## Running commands
 
 Run `scripts/temporal-cli.sh <temporal command>` from the repository root with Bash.
-It opens a Session Manager tunnel through an ECS host to
-temporal-frontend.postiz.internal:7233, runs that one command and closes the
-tunnel (about 5 s). Put the command first, then its flags. Several calls can run
-at once. Add `-o json` when you need to parse the output. The app namespace is
-`default`, which is also the CLI's default.
+It opens a Session Manager tunnel through an ECS host to the read-only proxy
+temporal-readonly.postiz.internal:7233, which passes only read calls on to the
+frontend, runs that one command and closes the tunnel (about 5 s). This works
+with an admin sign-in and with the team's read-only role (postiz-team-readonly).
+Put the command first, then its flags. Several calls can run at once. Add
+`-o json` when you need to parse the output. The app namespace is `default`,
+which is also the CLI's default.
 
 - This uses the local AWS CLI, not the AWS MCP server: the MCP sandbox can't
   hold a Session Manager connection.
@@ -34,23 +36,28 @@ at once. Add `-o json` when you need to parse the output. The app namespace is
 
 ## Changes need the user's OK
 
-The frontend has no authorization: anyone connected can terminate, reset or
-delete anything. The script runs only reads (list, describe, show, count, query
-and similar) and refuses anything else unless `--write` comes first. Before any
-`--write` command, show the user the exact command and what it will change, and
-wait for their OK. Don't get around the check with the keep-open tunnel or a raw
-`temporal` call. The `allowed-tools` grant above leaves `--write` out on
-purpose, so it still goes through the normal permission check.
+Reads go through the read-only proxy, which answers any other call with
+`403 (Forbidden)`. `--write` tunnels straight to the frontend instead, which has
+no authorization: anyone connected can terminate, reset or delete anything, and
+only an admin sign-in (AccountFullAccessRole) may open that tunnel. The script
+also refuses non-read commands before connecting unless `--write` comes first.
+Before any `--write` command, show the user the exact command and what it will
+change, and wait for their OK. Don't get around the check with the keep-open
+tunnel or a raw `temporal` call. The `allowed-tools` grant above leaves
+`--write` out on purpose, so it still goes through the normal permission check.
 
 Be most careful with `post_*` workflows: terminating one means that post never
 publishes, and resetting one can publish it twice.
 
 ## When it fails
 
-- AccessDenied on ssm:StartSession, ExpiredToken, or no credentials: the shell
-  needs an admin sign-in (both read-only roles deny Session Manager). Ask the
-  user to sign in again in a real terminal (`aws login --profile <profile>`);
-  don't try other roles.
+- ExpiredToken or no credentials: ask the user to sign in again in a real
+  terminal (`aws login --profile <profile>`); don't try other roles.
+- AccessDenied on ssm:StartSession: reads need AccountFullAccessRole or
+  postiz-team-readonly (postiz-agent-readonly denies Session Manager); `--write`
+  needs AccountFullAccessRole. Tell the user which one the command needs.
+- `403 (Forbidden)`: the read-only proxy refused a call that is not a read. That
+  is by design; a change needs `--write`, an admin sign-in and the user's OK.
 - `SessionManagerPlugin is not found`: install the Session Manager plugin.
   `temporal: command not found`: `brew install temporal`.
 - `the tunnel did not open within 30 s`: check that the ECS hosts are online in
