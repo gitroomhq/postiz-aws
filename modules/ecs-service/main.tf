@@ -149,7 +149,7 @@ resource "aws_ecs_task_definition" "this" {
   lifecycle {
     precondition {
       condition     = !local.fargate || (local.awsvpc && length(var.host_volumes) == 0)
-      error_message = "Fargate needs network_mode = \"awsvpc\" and no host_volumes."
+      error_message = "Fargate needs network_mode = \"awsvpc\" and no host_volumes (efs_volumes work)."
     }
     precondition {
       condition     = local.fargate || var.capacity_provider_name != null
@@ -167,6 +167,26 @@ resource "aws_ecs_task_definition" "this" {
     content {
       name      = volume.key
       host_path = volume.value
+    }
+  }
+
+  dynamic "volume" {
+    for_each = var.efs_volumes
+    content {
+      name = volume.key
+      efs_volume_configuration {
+        file_system_id = volume.value.file_system_id
+        # with an access point the root comes from the access point and must stay "/"
+        root_directory     = volume.value.access_point_id == null ? volume.value.root_directory : "/"
+        transit_encryption = "ENABLED"
+        dynamic "authorization_config" {
+          for_each = volume.value.access_point_id == null ? [] : [volume.value.access_point_id]
+          content {
+            access_point_id = authorization_config.value
+            iam             = "ENABLED"
+          }
+        }
+      }
     }
   }
 }
