@@ -1,9 +1,11 @@
-# Read-only SQL for the team, without opening the database to anything outside
-# the VPC: no public endpoint, no tunnel. Members of the team's read-only group
-# (bootstrap/: postiz-team-readonly, granted through account access manager) open
-# CloudShell inside the VPC and run psql as the PostgreSQL role "readonly". They
-# sign in with a 15-minute IAM token (aws rds generate-db-auth-token), so that
-# role has no password to hand out, leak or rotate.
+# Read-only SQL for the team, with no public endpoint. Members of the team's
+# read-only group (bootstrap/: postiz-team-readonly, granted through account access
+# manager) run psql as the PostgreSQL role "readonly", either in CloudShell inside
+# the VPC (below) or from their own machine through the Session Manager tunnel
+# postiz-team-postgres-readonly, which reaches only the database's port
+# (team-tunnels.tf, scripts/psql-readonly.sh). They sign in with a 15-minute IAM
+# token (aws rds generate-db-auth-token), so that role has no password to hand out,
+# leak or rotate, and the tunnel alone signs nobody in.
 #
 # What "readonly" may read is set inside PostgreSQL, where Terraform cannot
 # reach: `migrate-postgres.sh readonly-role` in the ops task creates the role and

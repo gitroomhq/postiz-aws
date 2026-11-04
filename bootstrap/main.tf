@@ -311,8 +311,8 @@ resource "aws_iam_role_policy" "agent_extra" {
 # Members sign in through the account access portal or with `aws login`.
 # environments/production adds the inline policies query-database-readonly
 # (db-readers.tf): CloudShell inside the VPC and the database's readonly sign-in;
-# and temporal-readonly-tunnel (temporal-readonly.tf): a Session Manager tunnel to
-# the read-only Temporal proxy.
+# and session-manager-tunnels (team-tunnels.tf): Session Manager tunnels to the
+# read-only Temporal proxy and to PostgreSQL.
 
 data "aws_iam_policy_document" "team_trust" {
   statement {
@@ -367,8 +367,9 @@ data "aws_iam_policy_document" "no_secret_values" {
   }
 
   # Session Manager only with the team's own session documents, postiz-team-*,
-  # which environments/production creates with host and port fixed inside (the
-  # read-only Temporal tunnel, temporal-readonly.tf). Every other document is
+  # which environments/production creates with host and port fixed inside
+  # (team-tunnels.tf: the read-only Temporal proxy, PostgreSQL for the readonly
+  # role). Every other document is
   # denied: the default shell (SSM-SessionManagerRunShell, which a session without
   # --document-name uses), AWS-StartPortForwardingSession*, interactive commands.
   # So are ECS task targets. Instances are left to the allow in

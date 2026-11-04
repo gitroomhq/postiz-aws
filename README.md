@@ -160,7 +160,7 @@ modules/
 environments/production/   everything else; app-env-keys.json = env var names per service
   tests/                   offline plan test with mocked providers
 docker/                    postiz-app.Dockerfile (one image per app), postiz.Dockerfile (all-in-one, before the split), ops.Dockerfile (migration toolbox)
-scripts/                   migration, env copy, Temporal UI tunnel and CLI, test browser, ECR retag
+scripts/                   migration, env copy, Temporal UI tunnel and CLI, read-only psql, test browser, ECR retag
 .claude/skills/temporal/   Claude Code skill: production Temporal through scripts/temporal-cli.sh
 .github/workflows/         terraform (plan on PR, apply on main), deploy-postiz, ops-image
 docs/migration-runbook.md
@@ -270,9 +270,11 @@ The frontend has no authorization, so reads go to the read-only proxy
 passes an exact list of read calls (list, describe, get, count, query, health)
 and answers anything else with 403 (Forbidden), whatever client connects. Its
 access log records every call, refused ones included. The tunnel uses the
-Session Manager document `postiz-team-temporal-readonly`, which fixes the host
-and port, so the team's read-only role (postiz-team-readonly) can use it too:
-bootstrap/ denies that role every other session document, the shell included.
+Session Manager document `postiz-team-temporal-readonly`
+([team-tunnels.tf](environments/production/team-tunnels.tf)), which fixes the
+host and port, so the team's read-only role (postiz-team-readonly) can use it
+too: bootstrap/ denies that role every session document not named
+`postiz-team-*`, the shell included.
 `--write` tunnels straight to the frontend for any command and needs an admin
 sign-in. The script also refuses non-read commands before connecting unless
 `--write` comes first. Needs the Session Manager plugin and the Temporal CLI
@@ -339,16 +341,31 @@ It is `ReadOnlyAccess` plus Terraform state, with secret values,
 
 **Query the database (read-only):** members of the team's read-only group in
 IAM Identity Center (the account access manager entitlement to
-`postiz-team-readonly`) can run SQL on the `postiz` database from CloudShell,
-inside the VPC. Nothing opens the database to the outside: no public endpoint,
-no tunnel. They sign in as the PostgreSQL role `readonly` with a 15-minute IAM
-token, so the role has no password. It reads every table except the columns
+`postiz-team-readonly`) can run SQL on the `postiz` database from their own
+machine through a Session Manager tunnel, or from CloudShell inside the VPC. The
+database has no public endpoint, and the tunnel (document
+`postiz-team-postgres-readonly`,
+[team-tunnels.tf](environments/production/team-tunnels.tf)) reaches only its
+PostgreSQL port. Either way they sign in as the PostgreSQL role `readonly` with a
+15-minute IAM token, so the role has no password and the tunnel alone signs
+nobody in. It reads every table except the columns
 that hold credentials (OAuth tokens and codes, API keys, password hashes, OAuth
 client secrets, webhook URLs, Mastra's chat-platform and MCP configs). On those
 few tables `SELECT *` fails, so name the columns. Transactions are read-only,
 statements stop after 60 seconds, and the role gets 5 connections. The team
 role also can't download the RDS log files, which hold slow statements with
 their parameters.
+
+From your own machine, signed in with `aws login` (the read-only access or an
+admin one), with the Session Manager plugin and psql (`brew install libpq`):
+
+```bash
+scripts/psql-readonly.sh                                    # interactive psql
+scripts/psql-readonly.sh -c 'select count(*) from "Post"'   # one query, any psql arguments
+scripts/psql-readonly.sh --tunnel                           # localhost:15432 for another client
+```
+
+From CloudShell:
 
 1. Sign in through the access portal with the read-only access, switch to
    us-east-2 and open **CloudShell**.

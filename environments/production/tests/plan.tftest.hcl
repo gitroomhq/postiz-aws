@@ -41,6 +41,11 @@ mock_provider "aws" {
     override_during = plan
     defaults        = { arn = "arn:aws:elasticloadbalancing:us-east-2:123456789012:targetgroup/postiz-production-app/0123456789abcdef" }
   }
+  # known at plan time (the instance exists), so the team's database tunnel can be checked
+  mock_resource "aws_db_instance" {
+    override_during = plan
+    defaults        = { address = "postiz-production-main.abcdefghijkl.us-east-2.rds.amazonaws.com", port = 5432 }
+  }
   # the real provider knows domain_validation_options[*].domain_name at plan time
   mock_resource "aws_acm_certificate" {
     override_during = plan
@@ -339,7 +344,7 @@ run "ses_sending_enabled" {
   }
 }
 
-run "temporal_readonly" {
+run "team_tunnels" {
   command = plan
 
   variables {
@@ -347,17 +352,36 @@ run "temporal_readonly" {
   }
 
   assert {
-    condition = (
-      jsondecode(aws_ssm_document.temporal_readonly_tunnel.content).properties.host == "temporal-readonly.postiz.internal" &&
-      jsondecode(aws_ssm_document.temporal_readonly_tunnel.content).properties.portNumber == "7233" &&
-      keys(jsondecode(aws_ssm_document.temporal_readonly_tunnel.content).parameters) == ["localPortNumber"]
-    )
-    error_message = "the team's tunnel reaches the read-only proxy only: host and port are fixed in the document, the local port is its only parameter"
+    condition = alltrue([
+      for d in aws_ssm_document.team_tunnel :
+      startswith(d.name, "postiz-team-") &&
+      d.document_type == "Session" &&
+      jsondecode(d.content).sessionType == "Port" &&
+      jsondecode(d.content).properties.type == "LocalPortForwarding" &&
+      keys(jsondecode(d.content).parameters) == ["localPortNumber"]
+    ])
+    error_message = "every team tunnel is named postiz-team-* (the only documents bootstrap/ lets the team use) and forwards to a host and port fixed in the document: the local port is its only parameter"
   }
 
   assert {
-    condition     = startswith(aws_ssm_document.temporal_readonly_tunnel.name, "postiz-team-")
-    error_message = "bootstrap/ lets the team use only session documents named postiz-team-*"
+    condition = (
+      jsondecode(aws_ssm_document.team_tunnel["temporal-readonly"].content).properties.host == "temporal-readonly.postiz.internal" &&
+      jsondecode(aws_ssm_document.team_tunnel["temporal-readonly"].content).properties.portNumber == "7233"
+    )
+    error_message = "the Temporal tunnel reaches the read-only proxy, never the frontend"
+  }
+
+  assert {
+    condition = (
+      jsondecode(aws_ssm_document.team_tunnel["postgres-readonly"].content).properties.host == "postiz-production-main.abcdefghijkl.us-east-2.rds.amazonaws.com" &&
+      jsondecode(aws_ssm_document.team_tunnel["postgres-readonly"].content).properties.portNumber == "5432"
+    )
+    error_message = "the database tunnel reaches the main RDS instance's PostgreSQL port and nothing else"
+  }
+
+  assert {
+    condition     = keys(aws_ssm_document.team_tunnel) == ["postgres-readonly", "temporal-readonly"]
+    error_message = "a new team tunnel needs a review: the team's role can open every document in team-tunnels.tf"
   }
 
   assert {

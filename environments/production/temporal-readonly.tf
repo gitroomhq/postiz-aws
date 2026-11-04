@@ -3,12 +3,11 @@
 # The frontend has no authorization: whoever reaches temporal-frontend:7233 can
 # terminate, reset or delete any workflow. So the team never reaches it. They reach
 # temporal-readonly.postiz.internal:7233, a Caddy proxy that forwards an exact list
-# of read calls to the frontend and refuses everything else with PermissionDenied.
+# of read calls to the frontend and refuses everything else with 403 (Forbidden).
 # The refusal happens here, on the server side, whatever client connects.
 #
-# The only way in is a Session Manager tunnel with the document below, whose host
-# and port are fixed inside it, relayed by an ECS host. bootstrap/ denies the team
-# every other session document (the shell, free port forwards), and ECS Exec.
+# The only way in is the Session Manager tunnel postiz-team-temporal-readonly
+# (team-tunnels.tf), whose host and port are fixed, relayed by an ECS host.
 # scripts/temporal-cli.sh sends reads this way for everyone; --write still goes
 # straight to the frontend and needs an admin sign-in.
 
@@ -143,79 +142,3 @@ module "temporal_readonly" {
   log_retention_days = var.log_retention_days
 }
 
-# The tunnel's Session Manager document. Host and port are part of the document, not
-# parameters, so a session with it reaches the proxy and nothing else. The name must
-# keep the postiz-team- prefix: bootstrap/ denies the team every other document.
-resource "aws_ssm_document" "temporal_readonly_tunnel" {
-  name            = "postiz-team-temporal-readonly"
-  document_type   = "Session"
-  document_format = "JSON"
-
-  content = jsonencode({
-    schemaVersion = "1.0"
-    description   = "Port forward to the read-only Temporal proxy ${local.temporal_readonly_host}:7233 and nowhere else"
-    sessionType   = "Port"
-    parameters = {
-      localPortNumber = {
-        type           = "String"
-        description    = "(Optional) Port on this machine. An open port is chosen at run time if not provided."
-        allowedPattern = "^([0-9]|[1-9][0-9]{1,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])$"
-        default        = "0"
-      }
-    }
-    properties = {
-      type            = "LocalPortForwarding"
-      host            = local.temporal_readonly_host
-      portNumber      = "7233"
-      localPortNumber = "{{ localPortNumber }}"
-    }
-  })
-}
-
-# Added to the team's role like query-database-readonly (db-readers.tf).
-data "aws_iam_policy_document" "team_temporal_readonly" {
-  statement {
-    sid       = "TemporalReadonlyTunnel"
-    actions   = ["ssm:StartSession"]
-    resources = [aws_ssm_document.temporal_readonly_tunnel.arn]
-  }
-
-  # Relayed by an ECS host: its network reaches the proxy.
-  statement {
-    sid       = "TunnelThroughEcsHosts"
-    actions   = ["ssm:StartSession"]
-    resources = ["arn:aws:ec2:${var.region}:${var.aws_account_id}:instance/*"]
-    condition {
-      test     = "StringEquals"
-      variable = "ssm:resourceTag/Name"
-      values   = ["${local.name}-ecs-host"]
-    }
-  }
-
-  # End or resume only their own sessions. Assumed-role sessions carry the tag
-  # aws:ssmmessages:session-id = <role id>:<session name>, which is aws:userid.
-  statement {
-    sid       = "OwnSessions"
-    actions   = ["ssm:TerminateSession", "ssm:ResumeSession"]
-    resources = ["*"]
-    condition {
-      test     = "StringLike"
-      variable = "ssm:resourceTag/aws:ssmmessages:session-id"
-      values   = ["&{aws:userid}*"]
-    }
-  }
-
-  # Newer Session Manager plugins open the data channel with the caller's
-  # credentials; it also needs the session's one-time token from StartSession.
-  statement {
-    sid       = "TunnelDataChannel"
-    actions   = ["ssmmessages:OpenDataChannel"]
-    resources = ["arn:aws:ssm:${var.region}:${var.aws_account_id}:session/*"]
-  }
-}
-
-resource "aws_iam_role_policy" "team_temporal_readonly" {
-  name   = "temporal-readonly-tunnel"
-  role   = var.team_readonly_role_name
-  policy = data.aws_iam_policy_document.team_temporal_readonly.json
-}
