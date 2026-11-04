@@ -12,7 +12,7 @@ variable "cluster_arn" {
 }
 
 variable "launch_type" {
-  description = "ec2: the cluster's EC2 capacity provider. fargate: FARGATE (ARM64), needs network_mode awsvpc and no host_volumes; cpu and memory are then also the task size."
+  description = "ec2: the cluster's EC2 capacity provider. fargate: FARGATE (ARM64), needs network_mode awsvpc and no host_volumes (efs_volumes work); cpu and memory are then also the task size."
   type        = string
   default     = "ec2"
 
@@ -131,6 +131,16 @@ variable "host_volumes" {
   description = "Volume name => host path."
   type        = map(string)
   default     = {}
+}
+
+variable "efs_volumes" {
+  description = "Volume name => EFS file system (works on Fargate and EC2). Always encrypted in transit; with an access point, IAM authorization is used, so the task role needs elasticfilesystem:ClientMount (and ClientWrite)."
+  type = map(object({
+    file_system_id  = string
+    root_directory  = optional(string, "/")
+    access_point_id = optional(string)
+  }))
+  default = {}
 }
 
 variable "mount_points" {
