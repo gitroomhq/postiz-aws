@@ -2,8 +2,9 @@
 # bootstrap/). Each document forwards a port on the caller's machine, through an
 # ECS host, to one host and port fixed in the document: neither is a parameter.
 # bootstrap/ denies the role every session document not named postiz-team-*, so
-# the documents here are all it can open: no shell, no free port forward, no ECS
-# Exec. What each tunnel reaches still decides what the caller may do:
+# the documents here (and one an internal app's root may add for its own Fargate
+# task) are all it can open: no shell, no free port forward, no ECS Exec. What
+# each tunnel reaches still decides what the caller may do:
 #
 #   postiz-team-temporal-readonly  the read-only Temporal proxy, which passes only
 #                                  read calls (temporal-readonly.tf)
@@ -72,6 +73,8 @@ data "aws_iam_policy_document" "team_tunnels" {
   }
 
   # Relayed by an ECS host: its network reaches the Temporal proxy and the database.
+  # IAM cannot tie a document to a target, so any postiz-team-* document opens on
+  # these hosts, an internal app's included: its fixed port must reach nothing here.
   statement {
     sid       = "TunnelThroughEcsHosts"
     actions   = ["ssm:StartSession"]

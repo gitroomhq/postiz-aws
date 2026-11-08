@@ -312,7 +312,9 @@ resource "aws_iam_role_policy" "agent_extra" {
 # environments/production adds the inline policies query-database-readonly
 # (db-readers.tf): CloudShell inside the VPC and the database's readonly sign-in;
 # and session-manager-tunnels (team-tunnels.tf): Session Manager tunnels to the
-# read-only Temporal proxy and to PostgreSQL.
+# read-only Temporal proxy and to PostgreSQL. The small internal apps' roots
+# (Fargate tasks in the same cluster) may add a tunnel of their own the same way:
+# a postiz-team-* document and an inline policy naming their task.
 
 data "aws_iam_policy_document" "team_trust" {
   statement {
@@ -369,12 +371,15 @@ data "aws_iam_policy_document" "no_secret_values" {
   # Session Manager only with the team's own session documents, postiz-team-*,
   # which environments/production creates with host and port fixed inside
   # (team-tunnels.tf: the read-only Temporal proxy, PostgreSQL for the readonly
-  # role). Every other document is
+  # role), as may an internal app's root for its own task. Every other document is
   # denied: the default shell (SSM-SessionManagerRunShell, which a session without
   # --document-name uses), AWS-StartPortForwardingSession*, interactive commands.
-  # So are ECS task targets. Instances are left to the allow in
-  # environments/production, which names only the ECS hosts. The agent role above
-  # still denies Session Manager entirely.
+  # Targets are left to the allows: environments/production names only the ECS
+  # hosts, and an ECS task (a session through its ECS Exec agent) needs an allow
+  # naming it, by the task's tags. With the documents above, a session into a task
+  # forwards one fixed port and opens no shell; aws ecs execute-command stays
+  # denied (NoSecretValues). The agent role above still denies Session Manager
+  # entirely.
   statement {
     sid     = "SessionManagerOnlyTeamDocuments"
     effect  = "Deny"
@@ -382,6 +387,7 @@ data "aws_iam_policy_document" "no_secret_values" {
     not_resources = [
       "arn:aws:ssm:${var.region}:${var.aws_account_id}:document/postiz-team-*",
       "arn:aws:ec2:${var.region}:${var.aws_account_id}:instance/*",
+      "arn:aws:ecs:${var.region}:${var.aws_account_id}:task/*",
     ]
   }
 }
