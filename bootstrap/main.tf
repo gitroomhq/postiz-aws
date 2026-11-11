@@ -315,6 +315,8 @@ resource "aws_iam_role_policy" "agent_extra" {
 # read-only Temporal proxy and to PostgreSQL. The small internal apps' roots
 # (Fargate tasks in the same cluster) may add a tunnel of their own the same way:
 # a postiz-team-* document and an inline policy naming their task.
+# Until 2026-11-18 the role can also read the values of the Postiz app's five
+# service secrets (team_secret_values below).
 
 data "aws_iam_policy_document" "team_trust" {
   statement {
@@ -353,12 +355,50 @@ resource "aws_iam_role_policy_attachment" "team_readonly_cli_login" {
   policy_arn = "arn:aws:iam::aws:policy/SignInLocalDevelopmentAccess"
 }
 
+# Secret values for a limited time. The team has to copy some keys out of the
+# Postiz app's service secrets, so until the moment below (UTC) the role may read
+# those five secrets and no other. IAM compares the date with the clock on every
+# request, so the access ends by itself, with no apply, also for someone who
+# signed in before. Reading ends then; a key that was copied stays copied until
+# it is rotated.
+#
+# Once the date has passed, delete these locals and team_secret_values below, and
+# in no_secret_values replace the three GetSecretValue statements by
+# "secretsmanager:GetSecretValue" in NoSecretValues.
+locals {
+  team_secret_values_until = "2026-11-18T23:59:59Z"
+
+  # Secrets Manager ends every ARN with a hyphen and six random characters.
+  team_secret_values_arns = [
+    for service in ["backend", "mcp", "frontend", "worker", "worker-2"] :
+    "arn:aws:secretsmanager:${var.region}:${var.aws_account_id}:secret:postiz/production/${service}-??????"
+  ]
+}
+
+data "aws_iam_policy_document" "team_secret_values" {
+  statement {
+    sid       = "AppSecretValuesUntilTheDate"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = local.team_secret_values_arns
+    condition {
+      test     = "DateLessThan"
+      variable = "aws:CurrentTime"
+      values   = [local.team_secret_values_until]
+    }
+  }
+}
+
+resource "aws_iam_role_policy" "team_secret_values" {
+  name   = "app-secret-values-until-${substr(local.team_secret_values_until, 0, 10)}"
+  role   = aws_iam_role.team_readonly.id
+  policy = data.aws_iam_policy_document.team_secret_values.json
+}
+
 data "aws_iam_policy_document" "no_secret_values" {
   statement {
     sid    = "NoSecretValues"
     effect = "Deny"
     actions = [
-      "secretsmanager:GetSecretValue",
       "secretsmanager:BatchGetSecretValue",
       "ssm:GetParameter",
       "ssm:GetParameters",
@@ -366,6 +406,41 @@ data "aws_iam_policy_document" "no_secret_values" {
       "ecs:ExecuteCommand",
     ]
     resources = ["*"]
+  }
+
+  # secretsmanager:GetSecretValue while the window above is open: never for a
+  # secret outside the list (the generated database, Valkey and Elasticsearch
+  # passwords, the internal apps), never from the date on, whatever else allows
+  # it, and never through Amazon Q chat, which calls AWS as the person signed in.
+  statement {
+    sid           = "NoOtherSecretValues"
+    effect        = "Deny"
+    actions       = ["secretsmanager:GetSecretValue"]
+    not_resources = local.team_secret_values_arns
+  }
+
+  statement {
+    sid       = "NoSecretValuesFromTheDateOn"
+    effect    = "Deny"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = ["*"]
+    condition {
+      test     = "DateGreaterThanEquals"
+      variable = "aws:CurrentTime"
+      values   = [local.team_secret_values_until]
+    }
+  }
+
+  statement {
+    sid       = "NoSecretValuesThroughAmazonQ"
+    effect    = "Deny"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = ["*"]
+    condition {
+      test     = "ForAnyValue:StringEquals"
+      variable = "aws:CalledVia"
+      values   = ["q.amazonaws.com"]
+    }
   }
 
   # Session Manager only with the team's own session documents, postiz-team-*,
