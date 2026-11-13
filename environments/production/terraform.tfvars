@@ -15,6 +15,11 @@ dns_cutover      = true
 # App email through Amazon SES instead of Resend (ses.tf); false switches back
 ses_sending_enabled = true
 
+# AWS WAF on the load balancer (waf.tf). Count only: no rule blocks until it is
+# listed in waf_blocking_rules
+waf_enabled        = true
+waf_blocking_rules = []
+
 cloudflare_zone_name = "postiz.com"
 api_domain           = "api.postiz.com"
 mcp_domain           = "mcp.postiz.com"

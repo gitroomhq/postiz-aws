@@ -422,3 +422,92 @@ run "fargate_for_other_apps" {
     error_message = "the Postiz deploy role restarts only the Postiz services, not other apps in the cluster"
   }
 }
+
+run "waf_counts_only" {
+  command = plan
+
+  variables {
+    waf_enabled        = true
+    waf_blocking_rules = []
+  }
+
+  assert {
+    condition     = length(aws_wafv2_web_acl_association.alb) == 1 && aws_lb.main.enable_waf_fail_open
+    error_message = "the web ACL is attached, and the load balancer keeps routing if WAF cannot be reached"
+  }
+
+  assert {
+    condition     = length(aws_wafv2_web_acl.alb[0].default_action[0].allow) == 1 && length(aws_wafv2_web_acl.alb[0].rule) == 5
+    error_message = "the web ACL allows by default and carries the five rules"
+  }
+
+  assert {
+    condition = alltrue([
+      for r in aws_wafv2_web_acl.alb[0].rule :
+      alltrue([for a in r.action : length(a.block) == 0 && length(a.count) == 1]) &&
+      alltrue([for o in r.override_action : length(o.none) == 0 && length(o.count) == 1])
+    ])
+    error_message = "with waf_blocking_rules empty, every rule counts and none blocks"
+  }
+
+  assert {
+    condition     = length(aws_cloudwatch_metric_alarm.waf_blocked) == 1
+    error_message = "while everything counts, any blocked request raises an alarm"
+  }
+
+  assert {
+    condition     = aws_cloudwatch_log_group.waf[0].name == "aws-waf-logs-postiz-production" && length(aws_wafv2_web_acl_logging_configuration.alb[0].redacted_fields) == 3
+    error_message = "WAF logs go to an aws-waf-logs- group with the credential headers redacted"
+  }
+}
+
+run "waf_one_rule_blocking" {
+  command = plan
+
+  variables {
+    waf_enabled        = true
+    waf_blocking_rules = ["login-limit", "core-rules"]
+  }
+
+  assert {
+    condition = alltrue([
+      for r in aws_wafv2_web_acl.alb[0].rule :
+      alltrue([for a in r.action : length(a.block) == (r.name == "login-limit" ? 1 : 0)]) &&
+      alltrue([for o in r.override_action : length(o.none) == (r.name == "core-rules" ? 1 : 0)])
+    ])
+    error_message = "only the rules named in waf_blocking_rules block"
+  }
+
+  assert {
+    condition = alltrue([
+      for r in aws_wafv2_web_acl.alb[0].rule :
+      length(r.statement[0].managed_rule_group_statement[0].rule_action_override) == 5
+      if r.name == "core-rules"
+    ])
+    error_message = "the core rules that match real traffic keep counting when core-rules blocks"
+  }
+}
+
+run "waf_off" {
+  command = plan
+
+  variables {
+    waf_enabled = false
+  }
+
+  assert {
+    condition     = length(aws_wafv2_web_acl.alb) == 0 && length(aws_wafv2_web_acl_association.alb) == 0 && length(aws_cloudwatch_log_group.waf) == 0
+    error_message = "without waf_enabled there is no web ACL, association or log group"
+  }
+}
+
+run "waf_unknown_rule" {
+  command = plan
+
+  variables {
+    waf_enabled        = true
+    waf_blocking_rules = ["everything"]
+  }
+
+  expect_failures = [var.waf_blocking_rules]
+}

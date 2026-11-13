@@ -114,6 +114,9 @@ resource "aws_lb" "main" {
   # third-party webhook or API client silently losing one is hard to debug
   drop_invalid_header_fields = false
   enable_deletion_protection = true
+  # with a web ACL attached (waf.tf): if WAF cannot be reached, route the request
+  # anyway instead of answering with an error
+  enable_waf_fail_open = true
 
   access_logs {
     bucket  = aws_s3_bucket.alb_logs.id

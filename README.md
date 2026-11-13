@@ -88,6 +88,14 @@ Cloudflare R2 (media) and RunPod (media processing) stay where they are.
   existing workflows kept working.
 - **Hosts patch themselves.** Each host is replaced every 14 days with the newest
   ECS-optimized AMI (SSM-resolved), and tasks are drained first.
+- **A web firewall that only counts.** AWS WAF sits on the load balancer with
+  Amazon's IP reputation list, the known-bad-inputs and core rule sets and two
+  rate limits, all in count mode: they record what they would block and let it
+  through. The generic core rules would stop real traffic here (bodies over 8 KB,
+  requests without a User-Agent, OAuth redirects to 127.0.0.1, long activation
+  links), so those keep counting for good
+  ([waf.tf](environments/production/waf.tf)). A rule blocks only once it is named
+  in `waf_blocking_rules`. On an ALB, WAF reads the first 8 KB of a body, no more.
 
 ## Cost
 
@@ -102,6 +110,7 @@ Fixed infrastructure at us-east-2 on-demand list prices (October 2026):
 | ALB (hours; plus $0.008 per LCU, about 1 GB/hour processed) | $16+ | $16+ |
 | Public IPv4, cross-AZ, Cloud Map (estimate) | $45 | $45 |
 | CloudWatch, Secrets Manager, ECR, logs bucket (estimate) | $70 | $70 |
+| AWS WAF: web ACL and 5 rules (plus $0.60 per million requests) | $10+ | $10+ |
 
 On top of that comes internet egress, $0.09/GB for the first 10 TB a month
 (the first 100 GB are free), and usually the largest line for Postiz: media
@@ -298,6 +307,16 @@ its basic auth). Nothing in the app changes. To turn it on:
    reach Google's token endpoint over HTTPS. A session lasts 12 hours, and signing
    in again is a redirect without a prompt while the Google session lasts.
 Removing both secrets and running the workflow again turns it off.
+
+**Web firewall (AWS WAF):** every rule counts until it is named in
+`waf_blocking_rules`. What a rule matched is in CloudWatch (namespace
+`AWS/WAFV2`, `CountedRequests` per rule) and in the log group
+`aws-waf-logs-postiz-production`, which keeps only counted and blocked requests,
+with the `authorization`, `cookie` and `auth` headers removed. To make a rule
+block, add its name to `waf_blocking_rules` in `terraform.tfvars` and apply;
+take it out to go back to counting. `waf_enabled = false` detaches the web ACL.
+While the list is empty, the alarm `postiz-production-waf-blocked` fires if
+anything is blocked at all.
 
 **Change an environment variable:**
 
