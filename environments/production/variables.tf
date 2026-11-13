@@ -81,6 +81,27 @@ variable "ses_sending_enabled" {
   default     = false
 }
 
+variable "token_encryption" {
+  description = <<-EOT
+    Encryption of the channel tokens in the Postiz database, on backend, mcp,
+    worker and worker-2 (encryption.tf):
+      off        tokens are stored plain
+      read-only  the services get the key and read encrypted tokens, new
+                 tokens are still stored plain
+      on         new and refreshed tokens are stored encrypted
+    Go off -> read-only -> on with one apply each, and run
+    scripts/token-encryption-key.sh before leaving "off". Going back from "on"
+    is "read-only" (encrypted tokens stay readable), never "off".
+  EOT
+  type        = string
+  default     = "off"
+
+  validation {
+    condition     = contains(["off", "read-only", "on"], var.token_encryption)
+    error_message = "token_encryption must be off, read-only or on."
+  }
+}
+
 variable "dns_cutover" {
   description = "Point api, mcp and platform at AWS. Delete the old Railway records in Cloudflare first."
   type        = bool

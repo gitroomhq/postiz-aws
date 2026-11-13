@@ -36,6 +36,7 @@ locals {
       temporal     = true
       redis        = true
       email        = true
+      tokens       = true
       health_check = null
       publishes    = false
     }
@@ -56,6 +57,7 @@ locals {
       temporal     = true
       redis        = true
       email        = true
+      tokens       = true
       health_check = null
       publishes    = false
     }
@@ -71,6 +73,7 @@ locals {
       temporal     = false
       redis        = false
       email        = false
+      tokens       = false
       health_check = null
       publishes    = false
     }
@@ -86,6 +89,7 @@ locals {
       temporal     = true
       redis        = true
       email        = true
+      tokens       = true
       health_check = local.worker_health_check
       publishes    = true
     }
@@ -102,6 +106,7 @@ locals {
       temporal     = true
       redis        = true
       email        = true
+      tokens       = true
       health_check = local.worker_health_check
       publishes    = true
     }
@@ -133,6 +138,12 @@ module "postiz" {
     # SES through the task role (ses.tf); EMAIL_PROVIDER from the secret (Railway's) until switched
     each.value.email ? { SES_REGION = var.region } : {},
     each.value.email && var.ses_sending_enabled ? { EMAIL_PROVIDER = "ses" } : {},
+    # channel tokens encrypted in the database, the key through the task role (encryption.tf)
+    each.value.tokens && var.token_encryption != "off" ? {
+      ENCRYPTION_PROVIDER   = "aws-kms"
+      ENCRYPTION_KMS_REGION = var.region
+    } : {},
+    each.value.tokens && var.token_encryption == "read-only" ? { ENCRYPTION_READ_ONLY = "true" } : {},
   )
   secrets = merge(
     # a name may not be both an environment variable and a secret
@@ -141,6 +152,9 @@ module "postiz" {
       if !(k == "EMAIL_PROVIDER" && each.value.email && var.ses_sending_enabled)
     },
     each.value.redis ? local.redis_url_secret : {},
+    each.value.tokens && var.token_encryption != "off" ? {
+      ENCRYPTION_KMS_DATA_KEY = aws_secretsmanager_secret.token_encryption_data_key.arn
+    } : {},
   )
 
   task_role_policy_json = each.value.email ? data.aws_iam_policy_document.ses_send.json : null

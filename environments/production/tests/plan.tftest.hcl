@@ -346,6 +346,56 @@ run "ses_sending_enabled" {
   }
 }
 
+run "token_encryption_off" {
+  command = plan
+
+  assert {
+    condition     = length(aws_iam_role_policy.token_decrypt) == 4 && !contains(keys(aws_iam_role_policy.token_decrypt), "frontend")
+    error_message = "backend, mcp and the workers may decrypt the data key before the encryption is on, the frontend never"
+  }
+
+  assert {
+    condition     = aws_kms_key.token_encryption.enable_key_rotation && aws_kms_alias.token_encryption.name == "alias/postiz-production-token-encryption"
+    error_message = "the key scripts/token-encryption-key.sh uses exists while the encryption is still off"
+  }
+}
+
+run "token_encryption_read_only" {
+  command = plan
+
+  variables {
+    token_encryption = "read-only"
+  }
+
+  assert {
+    condition     = length(module.postiz) == 5
+    error_message = "giving the services the key still plans every Postiz service"
+  }
+}
+
+run "token_encryption_on" {
+  command = plan
+
+  variables {
+    token_encryption = "on"
+  }
+
+  assert {
+    condition     = length(module.postiz) == 5
+    error_message = "encrypting new tokens still plans every Postiz service"
+  }
+}
+
+run "token_encryption_unknown_value" {
+  command = plan
+
+  variables {
+    token_encryption = "true"
+  }
+
+  expect_failures = [var.token_encryption]
+}
+
 run "team_tunnels" {
   command = plan
 
