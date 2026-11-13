@@ -281,6 +281,30 @@ variable "temporal_num_history_shards" {
   default     = 4
 }
 
+# --- web firewall --------------------------------------------------------------------
+
+variable "waf_enabled" {
+  description = "Attach an AWS WAF web ACL to the load balancer (waf.tf). Every rule only counts until it is named in waf_blocking_rules. Billed per request, about $0.60 per million."
+  type        = bool
+  default     = false
+}
+
+variable "waf_blocking_rules" {
+  description = <<-EOT
+    Web ACL rules that block instead of count: any of ip-reputation,
+    known-bad-inputs, core-rules, flood-limit, login-limit. Add one at a time,
+    after reading what it counted (CloudWatch namespace AWS/WAFV2, log group
+    aws-waf-logs-<name>); removing it puts the rule back to counting.
+  EOT
+  type        = set(string)
+  default     = []
+
+  validation {
+    condition     = length(setsubtract(var.waf_blocking_rules, ["ip-reputation", "known-bad-inputs", "core-rules", "flood-limit", "login-limit"])) == 0
+    error_message = "Known rules: ip-reputation, known-bad-inputs, core-rules, flood-limit, login-limit."
+  }
+}
+
 # --- operations ----------------------------------------------------------------------
 
 variable "alert_emails" {
