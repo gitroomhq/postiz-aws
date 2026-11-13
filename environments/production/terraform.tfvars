@@ -15,6 +15,10 @@ dns_cutover      = true
 # App email through Amazon SES instead of Resend (ses.tf); false switches back
 ses_sending_enabled = true
 
+# Channel tokens encrypted in the database (encryption.tf): off -> read-only -> on,
+# one apply each, scripts/token-encryption-key.sh before leaving off
+token_encryption = "off"
+
 # AWS WAF on the load balancer (waf.tf). Count only: no rule blocks until it is
 # listed in waf_blocking_rules
 waf_enabled        = true

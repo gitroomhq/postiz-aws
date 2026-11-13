@@ -189,6 +189,25 @@ read-only profile.
 terraform -chdir=environments/production init -backend=false && terraform -chdir=environments/production test   # offline, no credentials
 ```
 
+**Channel token encryption:** the tokens Postiz holds for the connected
+channels can be stored encrypted ([encryption.tf](environments/production/encryption.tf)):
+postiz-app encrypts them with a data key that only KMS can give back, so a copy
+of the database or of the secrets cannot read them. `token_encryption` in
+`terraform.tfvars` turns it on in three applies:
+
+1. `off` (default): creates the KMS key, an empty secret and the task roles'
+   `kms:Decrypt`. Then run `scripts/token-encryption-key.sh` once to create the data key.
+2. `read-only`: backend, mcp and the workers get the key and read encrypted
+   tokens, new ones are still stored plain. Needs a postiz-app that has the encryption.
+3. `on`, once every service runs with step 2: new and refreshed tokens are
+   stored encrypted. Older tokens keep working plain; start postiz-app's
+   `encryptTokensWorkflow` (task queue `main`) to encrypt them all:
+   `scripts/temporal-cli.sh --write workflow start --type encryptTokensWorkflow --task-queue main --workflow-id encrypt-tokens`
+
+The KMS key and the data key secret must never be deleted (every channel would
+have to be connected again), and after step 3 a postiz-app from before the
+encryption must never be deployed. To step back, use `read-only`, not `off`.
+
 **Deploy Postiz:** pushing to postiz-app `main` deploys it, like on Railway.
 postiz-app's `.github/workflows/deploy-aws.yml` sends a `repository_dispatch` to
 this repo's **deploy-postiz** workflow. It skips commits that only touch docs,
