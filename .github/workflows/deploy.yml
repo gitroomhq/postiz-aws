@@ -19,6 +19,16 @@ name: deploy-postiz
 #
 # Every job runs in the "deploy" GitHub environment (main branch only, no
 # reviewers), the only one the deploy role trusts.
+#
+# What a run deploys: an automatic run is named after the postiz-app commit that
+# started it (title, author, short sha, sent with the dispatch), and the plan job's
+# summary links the commit, its author and its pull request for every run.
+
+run-name: >-
+  ${{ github.event.client_payload.title
+  && format('{0} · {1} · {2}', github.event.client_payload.title, github.event.client_payload.author, github.event.client_payload.short_sha)
+  || github.event_name == 'repository_dispatch' && format('postiz-app {0}', github.event.client_payload.ref)
+  || format('manual: {0} by {1}', github.event.inputs.ref, github.actor) }}
 
 on:
   workflow_dispatch:
@@ -76,15 +86,19 @@ jobs:
 
       # An automatic deploy only ships commits that are on the app's main branch,
       # so the dispatch token cannot deploy a branch or a fork's pull request.
+      # The summary says what is deploying: the commit, its author and the pull
+      # request it merged, read from GitHub and not from the dispatch payload.
       - name: commit
         id: commit
         env:
           APP_TOKEN: ${{ secrets.APP_REPO_TOKEN || github.token }}
           REF: ${{ github.event.inputs.ref || github.event.client_payload.ref || 'main' }}
+          PUSHER: ${{ github.event.client_payload.pusher }}
         run: |
           api() { curl -fsSL -H "Authorization: Bearer $APP_TOKEN" -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/$APP_REPOSITORY/$1"; }
           if ! [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]]; then echo "unexpected ref '$REF'" >&2; exit 1; fi
-          sha=$(api "commits/$REF" | jq -r .sha)
+          commit=$(api "commits/$REF" || true)
+          sha=$(jq -r '.sha // empty' <<< "$commit")
           if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then echo "cannot resolve '$REF' in $APP_REPOSITORY" >&2; exit 1; fi
           if [ "$GITHUB_EVENT_NAME" = repository_dispatch ]; then
             status=$(api "compare/$sha...main" | jq -r .status)
@@ -94,6 +108,22 @@ jobs:
             esac
           fi
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+          # never fails the deploy
+          pulls=$(api "commits/$sha/pulls" 2>/dev/null) || pulls='[]'
+          by="manual run of \`$REF\` by $GITHUB_ACTOR"
+          if [ "$GITHUB_EVENT_NAME" = repository_dispatch ]; then
+            by=""
+            if [[ "$PUSHER" =~ ^[A-Za-z0-9-]+(\[bot\])?$ ]]; then by="pushed by $PUSHER"; fi
+          fi
+          jq -r --arg repo "$APP_REPOSITORY" --arg by "$by" --argjson pulls "$pulls" '
+            def user: if .login then "[\(.login)](\(.html_url))" else null end;
+            ($pulls | map(select(.merged_at)) | first) as $pr
+            | "### \($pr.title // (.commit.message | split("\n") | first))",
+              "- commit [`\(.sha[0:12])`](\(.html_url)) of \($repo) by \((.author // {} | user) // .commit.author.name), \(.commit.author.date | sub("T"; " ") | sub(":[0-9]+Z$"; " UTC"))",
+              ($pr | select(.) | "- pull request [#\(.number)](\(.html_url)) by \((.user // {} | user) // "unknown")"),
+              ($by | select(length > 0) | "- \(.)")
+          ' <<< "$commit" | tee -a "$GITHUB_STEP_SUMMARY" || true
 
       - uses: aws-actions/configure-aws-credentials@v4
         with:
