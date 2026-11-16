@@ -211,7 +211,9 @@ encryption must never be deployed. To step back, use `read-only`, not `off`.
 **Deploy Postiz:** pushing to postiz-app `main` deploys it, like on Railway.
 postiz-app's `.github/workflows/deploy-aws.yml` sends a `repository_dispatch` to
 this repo's **deploy-postiz** workflow. It skips commits that only touch docs,
-the extension, the SDK or CI. One-time setup:
+the extension, the SDK or CI. Each automatic run is named after the commit that
+started it (title, author, short sha), and the run's summary links the commit,
+its author and its pull request. One-time setup:
 
 1. Create a fine-grained token with *Contents: read and write* on this repository only.
 2. Save it in postiz-app as the secret `POSTIZ_AWS_DISPATCH_TOKEN`.
