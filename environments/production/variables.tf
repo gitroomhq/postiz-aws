@@ -346,6 +346,17 @@ variable "guardduty_runtime_monitoring" {
   default     = true
 }
 
+variable "guardduty_fargate_monitoring" {
+  description = <<-EOT
+    GuardDuty's agent in the Fargate tasks of the cluster (the internal apps of
+    postiz-internal-infra), as a sidecar container GuardDuty attaches when a task
+    starts. A service gets it, or loses it, with its next deployment. Needs
+    guardduty_runtime_monitoring.
+  EOT
+  type        = bool
+  default     = true
+}
+
 variable "gated_apply_role_names" {
   description = <<-EOT
     The roles only the deploy gate hands out for terraform apply, in this
