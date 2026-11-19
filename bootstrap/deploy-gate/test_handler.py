@@ -279,6 +279,38 @@ class GateTest(unittest.TestCase):
         for secret in (code, self.wrong(), "ASIA", SECRET):
             self.assertNotIn(secret, log)
 
+    def logged(self):
+        return [json.loads(e) for e in self.events]
+
+    def test_every_refusal_is_logged_with_who_asked(self):
+        # a run of another repository
+        self.call("open", self.claims(repository_id="1", repository="evil/fork", actor="mallory"), {"code": self.code()})
+        # a run of this repository at a commit nobody approved
+        self.call("open", self.claims(sha=OTHER, workflow_sha=OTHER), {"code": self.code()})
+        # credentials without an approval
+        self.call("credentials")
+        first, second, third = self.logged()
+        self.assertEqual((first["event"], first["repository"], first["actor"], first["status"]), ("refused", "evil/fork", "mallory", 403))
+        self.assertIn("repository_id", first["reason"])
+        self.assertEqual((second["sha"], second["workflow_sha"], second["route"]), (OTHER, OTHER, "POST /open"))
+        self.assertIn("trusted", second["reason"])
+        self.assertEqual((third["route"], third["run_id"], third["run_attempt"]), ("POST /credentials", "777", "1"))
+        self.assertIn("no approval", third["reason"])
+        self.assertNotIn(self.code(), "\n".join(self.events))
+
+    def test_expired_and_locked_have_their_own_events(self):
+        self.call("open", body={"code": self.code(-10)})
+        for _ in range(5):
+            self.call("open", body={"code": self.wrong()})
+        self.open()
+        events = [(e["event"], e.get("failures")) for e in self.logged()]
+        self.assertEqual(events, [("expired", None)] + [("refused", n) for n in range(1, 6)] + [("locked", None)])
+        self.assertEqual(self.logged()[-1]["status"], 423)
+
+    def test_long_claims_are_cut_in_the_log(self):
+        self.call("open", self.claims(repository_id="1", ref="refs/heads/" + "x" * 5000))
+        self.assertLessEqual(len(self.logged()[0]["ref"]), 200)
+
 
 if __name__ == "__main__":
     unittest.main()

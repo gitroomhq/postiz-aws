@@ -28,13 +28,31 @@ import totp
 ISSUER = "https://token.actions.githubusercontent.com"
 SESSION_SECONDS = 3600  # the most a role assumed from another role can get
 EXPIRED_STEPS = 120  # a real code up to an hour old is late, not a guess
+# what the log says about who asked, from GitHub's token
+LOGGED_CLAIMS = (
+    "repository",
+    "ref",
+    "sha",
+    "workflow_sha",
+    "event_name",
+    "environment",
+    "run_id",
+    "run_attempt",
+    "actor",
+    "job_workflow_ref",
+)
 
 
 class Refused(Exception):
-    def __init__(self, status, message):
+    """A request the gate turns down. `message` goes to the caller; `event`,
+    `reason` and `details` go to the log."""
+
+    def __init__(self, status, message, event="refused", reason=None, **details):
         super().__init__(message)
         self.status = status
         self.message = message
+        self.event = event
+        self.details = {"reason": reason or message, **details}
 
 
 class Store:
@@ -167,8 +185,7 @@ class Gate:
 
         max_failures = self.config["max_failures"]
         if self.store.failures() >= max_failures:
-            self._event("locked", caller)
-            raise Refused(423, self._locked())
+            raise Refused(423, self._locked(), event="locked")
 
         secret = self.read_secret()
         step = totp.matching_step(secret, code, self.now())
@@ -177,11 +194,14 @@ class Gate:
             # a code that was right a while ago. That is not a guess, so it does not
             # count towards the lock: 120 of a million codes get this answer.
             if totp.matching_step(secret, code, self.now(), past=EXPIRED_STEPS, future=0) is not None:
-                self._event("expired", caller)
-                raise Refused(403, "this code has expired, codes are good for about a minute: start a new run with a new one")
-            raise Refused(403, self._wrong(caller, "wrong code"))
+                raise Refused(
+                    403,
+                    "this code has expired, codes are good for about a minute: start a new run with a new one",
+                    event="expired",
+                )
+            raise self._wrong("wrong code")
         if not self.store.accept_step(step, max_failures):
-            raise Refused(403, self._wrong(caller, "this code was already used, wait for the next one"))
+            raise self._wrong("this code was already used, wait for the next one")
 
         expires = int(self.now()) + caller["target"]["approval_seconds"]
         self.store.approve(
@@ -194,7 +214,7 @@ class Gate:
                 "ttl": expires + 30 * 86400,
             },
         )
-        self._event("opened", caller, expires=expires)
+        self.record("opened", claims, expires=expires)
         return self._opened(caller, expires)
 
     def credentials(self, claims, _body):
@@ -210,7 +230,7 @@ class Gate:
             f"github-{caller['run_id']}-{caller['attempt']}",
             SESSION_SECONDS,
         )
-        self._event("credentials", caller)
+        self.record("credentials", claims)
         return {"ok": True, "credentials": credentials}
 
     # --- helpers -----------------------------------------------------------
@@ -219,31 +239,28 @@ class Gate:
         until = time.strftime("%H:%M UTC", time.gmtime(expires))
         return {"ok": True, "message": f"approved: the {caller['environment']} role is open to this run until {until}"}
 
-    def _wrong(self, caller, reason):
+    def _wrong(self, reason):
+        """Counts a wrong code and says how many are left."""
         failures = self.store.record_failure()
-        self._event("refused", caller, reason=reason, failures=failures)
         max_failures = self.config["max_failures"]
         if failures >= max_failures:
-            return f"{reason}. {self._locked()}"
-        return f"{reason} ({failures} of {max_failures} before the gate locks)"
+            message = f"{reason}. {self._locked()}"
+        else:
+            message = f"{reason} ({failures} of {max_failures} before the gate locks)"
+        return Refused(403, message, reason=reason, failures=failures)
 
     def _locked(self):
         return "The gate is locked after too many wrong codes: scripts/deploy-gate.sh reset"
 
-    def _event(self, name, caller, **more):
-        self.log(
-            json.dumps(
-                {
-                    "event": name,
-                    "run_id": caller["run_id"],
-                    "attempt": caller["attempt"],
-                    "environment": caller["environment"],
-                    "sha": caller["sha"],
-                    "actor": caller["actor"],
-                    **more,
-                }
-            )
-        )
+    def record(self, event, claims, **more):
+        """One log line for everything the gate decides, refusals included: which
+        run asked, as GitHub's token names it. Never a code or a credential."""
+        entry = {"event": event}
+        for claim in LOGGED_CLAIMS:
+            if claims.get(claim) is not None:
+                entry[claim] = str(claims[claim])[:200]
+        entry.update(more)
+        self.log(json.dumps(entry))
 
 
 def respond(status, payload):
@@ -272,6 +289,9 @@ def handle(gate, event):
     try:
         return respond(200, route(claims, body))
     except Refused as refused:
+        # also a run of another repository or at a commit nobody approved: the
+        # log is where an attempt to get past the gate shows
+        gate.record(refused.event, claims, route=event["routeKey"], status=refused.status, **refused.details)
         return respond(refused.status, {"ok": False, "message": refused.message})
 
 

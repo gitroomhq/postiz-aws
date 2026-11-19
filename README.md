@@ -183,6 +183,7 @@ a pull request cannot change the gate either.
 | After every new commit on this repository's `main` | `scripts/deploy-gate.sh trust`: it lists the commits and files changed since the trusted commit and asks before it moves. Read the change first: this is the review the gate relies on |
 | A run was refused | The job log says why: a wrong, used or expired code, a commit that is not trusted, or a re-run (a re-run is a new attempt with the old code, so start a new run). A run that waits behind another deploy starts with an expired code: start it when the other one is done |
 | The gate is locked | `scripts/deploy-gate.sh reset`, after looking at who sent the wrong codes: `aws logs tail /aws/lambda/postiz-deploy-gate --since 1d` |
+| Did anyone try to get past it | `aws logs tail /aws/lambda/postiz-deploy-gate --since 7d --filter-pattern refused`: every refusal with the repository, branch, commit, run and person GitHub's token names. A refused run at a commit you do not know is someone changing the workflows |
 | New phone, lost phone | `scripts/deploy-gate.sh enroll --rotate` |
 | What is trusted, who is approved | `scripts/deploy-gate.sh status` |
 
@@ -204,7 +205,8 @@ token and the function decides on what it says (`bootstrap/deploy-gate/handler.p
 the first job of a run sends the code and gets that run attempt approved, for 90
 minutes in the `deploy` environment and two hours in `production`; every later
 job gets credentials for the role of its environment while the approval lasts.
-The function logs every decision, never a code or a credential. The
+The function logs every decision, refusals included, with the run that asked,
+never a code or a credential. The
 authenticator secret is created by `enroll` on your machine and stored where only
 the function can read it; it is in no Terraform state.
 
