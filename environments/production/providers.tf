@@ -18,6 +18,28 @@ provider "aws" {
   }
 }
 
+# The two other Regions the organization's policy leaves open: GuardDuty watches
+# them too (security.tf), nothing else is created there.
+provider "aws" {
+  alias               = "eu_west_1"
+  region              = "eu-west-1"
+  allowed_account_ids = [var.aws_account_id]
+
+  default_tags {
+    tags = local.tags
+  }
+}
+
+provider "aws" {
+  alias               = "ap_southeast_2"
+  region              = "ap-southeast-2"
+  allowed_account_ids = [var.aws_account_id]
+
+  default_tags {
+    tags = local.tags
+  }
+}
+
 # Reads CLOUDFLARE_API_TOKEN (Zone > Zone > Read for the zone lookup, Zone > DNS > Edit;
 # both on the postiz.com zone only).
 provider "cloudflare" {}

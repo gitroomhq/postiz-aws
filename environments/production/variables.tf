@@ -333,6 +333,47 @@ variable "log_retention_days" {
   default = 30
 }
 
+# --- security alerts (security.tf, audit-trail.tf) ---------------------------------------
+
+variable "guardduty_runtime_monitoring" {
+  description = <<-EOT
+    GuardDuty's agent on the ECS hosts and the Elasticsearch host: what tells that a
+    process on a machine is a crypto miner or a reverse shell. False takes it off
+    the detector; the agent already installed stops reporting and goes with the
+    host's next replacement.
+  EOT
+  type        = bool
+  default     = true
+}
+
+variable "gated_apply_role_names" {
+  description = <<-EOT
+    The roles only the deploy gate hands out for terraform apply, in this
+    repository and the others it serves (bootstrap/). A change they make was
+    approved with a code, so it raises no security alert.
+  EOT
+  type        = list(string)
+  default     = ["postiz-github-terraform-apply", "postiz-internal-terraform-apply"]
+}
+
+variable "quiet_session_documents" {
+  description = <<-EOT
+    Prefixes of the Session Manager documents whose sessions raise no alert: the
+    team's fixed tunnels (team-tunnels.tf), opened dozens of times a day, and the
+    admins' free port forwards. Every other session is a shell and alerts. Take
+    "AWS-StartPortForwardingSession" out to hear about each free port forward too:
+    it reaches anything inside the VPC, the database included.
+  EOT
+  type        = list(string)
+  default     = ["postiz-team-", "AWS-StartPortForwardingSession"]
+}
+
+variable "cost_anomaly_threshold_usd" {
+  description = "Alert when a service's spend is this many dollars above what its own history predicts."
+  type        = number
+  default     = 100
+}
+
 variable "team_readonly_role_name" {
   description = "The team's read-only role from bootstrap/. db-readers.tf adds CloudShell inside the VPC and the database's readonly sign-in to it."
   type        = string

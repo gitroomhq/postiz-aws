@@ -49,6 +49,15 @@ resource "aws_db_parameter_group" "this" {
   }
 }
 
+# The names RDS writes to. Created here, before the export is turned on, so they
+# have a retention: a log group RDS creates by itself keeps everything forever.
+resource "aws_cloudwatch_log_group" "exports" {
+  for_each = toset(var.cloudwatch_logs_exports)
+
+  name              = "/aws/rds/instance/${var.identifier}/${each.key}"
+  retention_in_days = var.exported_log_retention_days
+}
+
 resource "aws_db_instance" "this" {
   identifier     = var.identifier
   engine         = "postgres"
@@ -84,6 +93,8 @@ resource "aws_db_instance" "this" {
   apply_immediately            = false
   performance_insights_enabled = true
 
+  enabled_cloudwatch_logs_exports = var.cloudwatch_logs_exports
+
   deletion_protection       = true
   skip_final_snapshot       = false
   final_snapshot_identifier = "${var.identifier}-final"
@@ -91,6 +102,8 @@ resource "aws_db_instance" "this" {
   lifecycle {
     prevent_destroy = true
   }
+
+  depends_on = [aws_cloudwatch_log_group.exports]
 }
 
 resource "aws_secretsmanager_secret" "admin" {

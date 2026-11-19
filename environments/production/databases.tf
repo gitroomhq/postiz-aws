@@ -36,7 +36,16 @@ module "postgres_main" {
   # keep signing in with their passwords.
   iam_database_authentication = true
 
+  # Who connected, when, from which address, as which role and to which database:
+  # the record to read when a sign-in looks wrong (security.tf). Kept 90 days in
+  # /aws/rds/instance/<identifier>/postgresql, next to the slow queries. About
+  # 9,000 connections a day (pg_stat_database, November 2026), so a few megabytes
+  # of log. Both parameters take effect without a restart.
+  cloudwatch_logs_exports = ["postgresql"]
+
   parameters = {
+    log_connections            = { value = "1", apply_method = "immediate" }
+    log_disconnections         = { value = "1", apply_method = "immediate" }
     log_min_duration_statement = { value = "1000", apply_method = "immediate" }
     # Prisma negotiates TLS on its own, but Mastra's PostgresStore (node-postgres,
     # same DATABASE_URL) only uses TLS when the URL asks for it, and node-postgres

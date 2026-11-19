@@ -111,6 +111,7 @@ Fixed infrastructure at us-east-2 on-demand list prices (October 2026):
 | Public IPv4, cross-AZ, Cloud Map (estimate) | $45 | $45 |
 | CloudWatch, Secrets Manager, ECR, logs bucket (estimate) | $70 | $70 |
 | AWS WAF: web ACL and 5 rules (plus $0.60 per million requests) | $10+ | $10+ |
+| Security alerts: GuardDuty (hosts, databases, API calls; plus $1 per GB of DNS logs), audit trail copy, alarms (estimate) | $45+ | $45+ |
 
 On top of that comes internet egress, $0.09/GB for the first 10 TB a month
 (the first 100 GB are free), and usually the largest line for Postiz: media
@@ -276,6 +277,7 @@ modules/
   ecs-cluster/             ECS cluster, Graviton ASG, capacity provider
   ecs-service/             task definition + service (+ ALB, Cloud Map, autoscaling)
   rds-postgres/            RDS with write-only admin password and alarms
+  guardduty/               GuardDuty in one Region, findings sent on to the Region with the alerts
 environments/production/   everything else; app-env-keys.json = env var names per service
   tests/                   offline plan test with mocked providers
 docker/                    postiz-app.Dockerfile (one image per app), postiz.Dockerfile (all-in-one, before the split), ops.Dockerfile (migration toolbox)
@@ -442,6 +444,46 @@ block, add its name to `waf_blocking_rules` in `terraform.tfvars` and apply;
 take it out to go back to counting. `waf_enabled = false` detaches the web ACL.
 While the list is empty, the alarm `postiz-production-waf-blocked` fires if
 anything is blocked at all.
+
+**Security alerts:** `security.tf` and `audit-trail.tf` tell when someone got
+in; they block nothing. Everything arrives from the sender **Postiz SECURITY**
+(the topic `postiz-production-security`, the same addresses as the alarms), so
+a mail filter can send it to a phone. An address receives nothing until it
+opened the confirmation link AWS mailed it after the apply.
+
+| Alert | It means | Usual innocent cause |
+|---|---|---|
+| GuardDuty finding, severity 4 and up | AWS saw a known attack pattern: a stolen credential used from a new place, a crypto miner or reverse shell on a host, an odd sign-in or an unusual volume of reads on a database | none; read the finding |
+| `shell-session` | ECS Exec, or a Session Manager shell on a host | you, debugging |
+| `database-change` | an RDS instance, snapshot or parameter group was changed, shared, copied, exported or restored, outside the deploy gate | a change by hand |
+| `network-opened` | a security group got a new inbound rule, outside the deploy gate | a change by hand |
+| `detection-changed` | the trail, GuardDuty, an alert rule, an alarm or the topic was changed, outside the deploy gate | a change by hand |
+| alarm `...-security-iam-user-or-key` | an IAM user, password or access key was created | none: the account has no IAM users |
+| alarm `...-security-iam-role-change` | a role or its permissions changed, outside the deploy gate | a `bootstrap/` apply, which is always by hand |
+| alarm `...-security-other-region` | something was created or changed outside us-east-2 | none |
+| alarm `...-security-root-used` | the root user acted | none |
+| Cost anomaly | a service costs $100 more than its history predicts | a real traffic jump |
+
+"Outside the deploy gate" means: not by the roles the gate hands out
+(`gated_apply_role_names`), so a `terraform apply` run from Actions with a code
+is quiet. The team's tunnels and port forwards are quiet too
+(`quiet_session_documents`), or the dozens a day would bury the rest.
+
+When one arrives and it was not you or the team: the email names the role and
+the address the call came from. Every API call of the last 90 days is
+searchable in Logs Insights on `/aws/cloudtrail/postiz-production` (older ones,
+up to 400 days, are files in the `postiz-production-cloudtrail-*` bucket), and
+who connected to PostgreSQL in `/aws/rds/instance/postiz-production-main/postgresql`.
+A credential that may be in other hands: `scripts/deploy-gate.sh revoke` for a
+person's deploy access, and for an app's secret, change it at its source and in
+Secrets Manager, then restart the services.
+
+What it does not see: a break-in through Postiz itself (a stolen admin login,
+an API used within its limits), and what was typed in a shell. GuardDuty's
+agent runs on the EC2 hosts only, not in the internal apps' Fargate tasks
+(`guardduty_runtime_monitoring = false` takes it off). The first 30 days of
+GuardDuty are free, and its console's Usage page shows what each part will
+cost. This repository is public, so anyone can read which calls alert.
 
 **Change an environment variable:**
 
