@@ -11,30 +11,42 @@ OTHER_SECRET = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
 ME, COLLEAGUE, STRANGER = "1001", "2002", "3003"  # GitHub user ids
 TRUSTED = "a" * 40
 OTHER = "b" * 40
+HERE, ELSEWHERE = "1436140501", "5550001"  # GitHub repository ids
 CONFIG = {
     "audience": "postiz-deploy-gate",
-    "repository_id": "1436140501",
     "repository_owner_id": "128401275",
     "ref": "refs/heads/main",
     "max_failures": 5,
-    "targets": {
-        "deploy": {"role_arn": "arn:aws:iam::123456789012:role/deploy", "approval_seconds": 5400},
-        "production": {"role_arn": "arn:aws:iam::123456789012:role/apply", "approval_seconds": 7200},
+    "repositories": {
+        HERE: {
+            "name": "acme/platform",
+            "targets": {
+                "deploy": {"role_arn": "arn:aws:iam::123456789012:role/deploy", "right": "deploy", "approval_seconds": 5400},
+                "production": {"role_arn": "arn:aws:iam::123456789012:role/apply", "right": "production", "approval_seconds": 7200},
+            },
+        },
+        ELSEWHERE: {
+            "name": "acme/internal",
+            "targets": {
+                "deploy-bot": {"role_arn": "arn:aws:iam::123456789012:role/bot-deploy", "right": "deploy", "approval_seconds": 3600},
+                "production": {"role_arn": "arn:aws:iam::123456789012:role/internal-apply", "right": "production", "approval_seconds": 7200},
+            },
+        },
     },
 }
 
 
 class FakeStore:
     def __init__(self, trusted=TRUSTED):
-        self.trusted = trusted
+        self.trusted = {HERE: trusted, ELSEWHERE: OTHER}
         self.users = {
             ME: {"login": "someone", "environments": ["deploy", "production"]},
             COLLEAGUE: {"login": "colleague", "environments": ["deploy"]},
         }
         self.approvals = {}
 
-    def trusted_sha(self):
-        return self.trusted
+    def trusted_sha(self, repository_id):
+        return self.trusted.get(repository_id)
 
     def user(self, actor_id):
         item = self.users.get(actor_id)
@@ -261,16 +273,78 @@ class GateTest(unittest.TestCase):
         self.assertEqual(self.open(workflow_sha=None)[0], 200)
 
     def test_nothing_is_trusted_at_first(self):
-        self.store.trusted = None
+        self.store.trusted[HERE] = None
         status, body = self.open()
         self.assertEqual(status, 403)
-        self.assertIn("no commit is trusted", body["message"])
+        self.assertIn("no commit of acme/platform is trusted", body["message"])
 
     def test_moving_the_trusted_commit_ends_running_approvals(self):
         self.open()
-        self.store.trusted = OTHER
+        self.store.trusted[HERE] = OTHER
         self.assertEqual(self.call("credentials")[0], 403)
         self.assertEqual(self.call("credentials", self.claims(sha=OTHER, workflow_sha=OTHER))[0], 403)
+
+    # --- more than one repository --------------------------------------------------
+
+    def elsewhere(self, **changes):
+        claims = {"repository_id": ELSEWHERE, "repository": "acme/internal", "sha": OTHER, "workflow_sha": OTHER, "environment": "deploy-bot", "run_id": "888"}
+        claims.update(changes)
+        return self.claims(**claims)
+
+    def test_another_repository_has_its_own_trusted_commit_and_roles(self):
+        status, _ = self.call("open", self.elsewhere(), {"code": self.code()})
+        self.assertEqual(status, 200)
+        self.call("credentials", self.elsewhere())
+        self.assertEqual(self.assumed, [("arn:aws:iam::123456789012:role/bot-deploy", "github-888-1", 3600)])
+        self.assertEqual(self.store.approvals["888#1"]["expires"], self.clock + 3600)
+
+    def test_the_trusted_commit_of_one_repository_is_nothing_in_the_other(self):
+        # the other repository at this one's trusted commit, and the other way round
+        status, body = self.call("open", self.elsewhere(sha=TRUSTED, workflow_sha=TRUSTED), {"code": self.code()})
+        self.assertEqual(status, 403)
+        self.assertIn("acme/internal", body["message"])
+        self.assertEqual(self.open(sha=OTHER, workflow_sha=OTHER)[0], 403)
+        self.assertNotIn("last_step", self.store.users[ME])
+
+    def test_an_environment_belongs_to_its_repository(self):
+        for claims in (self.claims(environment="deploy-bot"), self.elsewhere(environment="deploy")):
+            status, body = self.call("open", claims, {"code": self.code()})
+            self.assertEqual(status, 403)
+            self.assertIn("no GitHub environment", body["message"])
+        self.assertEqual(self.assumed, [])
+
+    def test_an_approval_does_not_cross_repositories(self):
+        self.assertEqual(self.open(environment="production")[0], 200)
+        # same run number and environment name, claimed for the other repository
+        claims = self.elsewhere(environment="production", run_id="777")
+        self.assertEqual(self.call("credentials", claims)[0], 403)
+        self.assertEqual(self.assumed, [])
+
+    def test_the_same_person_and_rights_everywhere(self):
+        # my colleague may deploy: also the other repository's bot, not its terraform
+        code = self.code(secret=OTHER_SECRET)
+        claims = self.elsewhere(actor="colleague", actor_id=COLLEAGUE)
+        self.assertEqual(self.call("open", claims, {"code": code})[0], 200)
+        status, body = self.call("open", self.elsewhere(actor="colleague", actor_id=COLLEAGUE, environment="production", run_id="889"), {"code": self.code(1, OTHER_SECRET)})
+        self.assertEqual(status, 403)
+        self.assertIn("may not run terraform apply", body["message"])
+
+    def test_a_role_that_does_not_trust_the_gate_yet(self):
+        def denied(role_arn, session_name, seconds):
+            raise handler.RoleNotAssumable("AccessDenied")
+
+        self.gate.assume_role = denied
+        self.call("open", self.elsewhere(), {"code": self.code()})
+        status, body = self.call("credentials", self.elsewhere())
+        self.assertEqual(status, 403)
+        self.assertIn("cannot hand out bot-deploy (AccessDenied)", body["message"])
+        self.assertEqual(self.logged()[-1]["reason"], "cannot assume the role: AccessDenied")
+
+    def test_a_code_is_used_up_for_every_repository(self):
+        self.assertEqual(self.open()[0], 200)
+        status, body = self.call("open", self.elsewhere(), {"code": self.code()})
+        self.assertEqual(status, 403)
+        self.assertIn("already used", body["message"])
 
     # --- one authenticator per person --------------------------------------------
 
@@ -297,7 +371,7 @@ class GateTest(unittest.TestCase):
         code = self.code(secret=OTHER_SECRET)
         status, body = self.call("open", self.colleague(environment="production"), {"code": code})
         self.assertEqual(status, 403)
-        self.assertIn("may not start runs in the production environment", body["message"])
+        self.assertIn("may not run terraform apply", body["message"])
         self.assertEqual(self.store.fails(COLLEAGUE), 0)
         self.assertEqual(self.call("open", self.colleague(), {"code": code})[0], 200)  # deploy is theirs
 

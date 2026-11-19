@@ -11,12 +11,17 @@ token's claims:
   POST /credentials  one hour of credentials for the role of the job's GitHub
                      environment, only for an approved run attempt
 
-Both need a manual run on the main branch of this repository, at the commit that
-scripts/deploy-gate.sh trust recorded, started by someone scripts/deploy-gate.sh
-enroll gave an authenticator and that environment. Everyone has their own secret,
-tied to their GitHub account by its numeric id: a code only opens runs its owner
-started. A code is accepted once, and a few wrong ones lock that person out until
-scripts/deploy-gate.sh reset.
+Both need a manual run on the main branch of a repository the gate serves, at
+the commit that scripts/deploy-gate.sh trust recorded for that repository,
+started by someone scripts/deploy-gate.sh enroll gave an authenticator and the
+right the environment asks for. Everyone has their own secret, tied to their
+GitHub account by its numeric id: a code only opens runs its owner started, in
+whichever of the repositories. A code is accepted once, and a few wrong ones lock
+that person out until scripts/deploy-gate.sh reset.
+
+The gate serves the repository holding this code and any other of the same owner
+that bootstrap names (REPOSITORIES): each has its own trusted commit, and its
+GitHub environments name the roles its runs get.
 
 The claims are trusted because API Gateway verified the token. Someone who can
 invoke this function directly can make them up: only account admins can.
@@ -59,11 +64,15 @@ class Refused(Exception):
         self.details = {"reason": reason or message, **details}
 
 
+class RoleNotAssumable(Exception):
+    """AWS did not let the gate assume a target's role."""
+
+
 class Store:
     """The gate's DynamoDB table, three kinds of items under the key "id":
-    "config" (the trusted commit), "user#<GitHub user id>" (someone who may start
-    runs: their environments, wrong codes and last used code) and
-    "run#<run>#<attempt>" (an approval)."""
+    "trust#<GitHub repository id>" (that repository's trusted commit),
+    "user#<GitHub user id>" (someone who may start runs: their rights, wrong codes
+    and last used code) and "run#<run>#<attempt>" (an approval)."""
 
     def __init__(self, table):
         self.table = table
@@ -71,8 +80,8 @@ class Store:
     def _get(self, key):
         return self.table.get_item(Key={"id": key}, ConsistentRead=True).get("Item")
 
-    def trusted_sha(self):
-        return (self._get("config") or {}).get("trusted_sha")
+    def trusted_sha(self, repository_id):
+        return (self._get("trust#" + repository_id) or {}).get("trusted_sha")
 
     def user(self, actor_id):
         return self._get("user#" + actor_id)
@@ -138,19 +147,24 @@ class Gate:
         expected = {
             "iss": ISSUER,
             "aud": config["audience"],
-            "repository_id": config["repository_id"],
             "repository_owner_id": config["repository_owner_id"],
             "ref": config["ref"],
             "event_name": "workflow_dispatch",
         }
         for claim, value in expected.items():
             if str(claims.get(claim, "")) != value:
-                raise Refused(403, f"not a manual run on {config['ref']} of this repository ({claim})")
+                raise Refused(403, f"not a manual run on {config['ref']} of a repository the gate serves ({claim})")
+
+        # the repository by its id: a name can be given to another repository
+        repository_id = str(claims.get("repository_id", ""))
+        repository = config["repositories"].get(repository_id)
+        if repository is None:
+            raise Refused(403, "not a repository the gate serves (repository_id)")
 
         environment = str(claims.get("environment", ""))
-        target = config["targets"].get(environment)
+        target = repository["targets"].get(environment)
         if target is None:
-            raise Refused(403, "the job runs in no GitHub environment that has a role")
+            raise Refused(403, f"the job runs in no GitHub environment of {repository['name']} that has a role")
 
         run_id, attempt = str(claims.get("run_id", "")), str(claims.get("run_attempt", ""))
         if not (run_id.isdigit() and attempt.isdigit()):
@@ -158,15 +172,19 @@ class Gate:
 
         # the commit of the run, and of its workflow file when the token carries it
         commits = {str(claims[c]) for c in ("sha", "workflow_sha") if claims.get(c)}
-        trusted = self.store.trusted_sha()
+        trusted = self.store.trusted_sha(repository_id)
         if not trusted:
-            raise Refused(403, "no commit is trusted yet: run scripts/deploy-gate.sh trust")
+            raise Refused(
+                403,
+                f"no commit of {repository['name']} is trusted yet: "
+                "run scripts/deploy-gate.sh trust in a clone of it",
+            )
         if commits != {trusted}:
             shown = ", ".join(sorted(c[:12] for c in commits)) or "unknown"
             raise Refused(
                 403,
-                f"this run is at commit {shown}, the trusted one is {trusted[:12]}: "
-                "review what changed and run scripts/deploy-gate.sh trust",
+                f"this run is at commit {shown} of {repository['name']}, the trusted one is {trusted[:12]}: "
+                "review what changed and run scripts/deploy-gate.sh trust in a clone of it",
             )
 
         # who started the run: GitHub's numeric id, a login can be renamed and reused
@@ -179,17 +197,22 @@ class Gate:
                 f"{actor} has no authenticator for the deploy gate: "
                 f"an admin gives one with scripts/deploy-gate.sh enroll {actor}",
             )
-        if environment not in (user.get("environments") or ()):
+        # What the person may do is stored as the environments of the first
+        # repository, "deploy" and "production" (terraform apply). An environment
+        # of another repository says which of the two it asks for.
+        right = target.get("right", environment)
+        if right not in (user.get("environments") or ()):
+            what = "run terraform apply" if right == "production" else f"start runs in the {environment} environment"
             raise Refused(
                 403,
-                f"{actor} may not start runs in the {environment} environment: "
-                "an admin changes that with scripts/deploy-gate.sh grant",
+                f"{actor} may not {what}: an admin changes that with scripts/deploy-gate.sh grant",
             )
 
         return {
             "run": f"{run_id}#{attempt}",
             "run_id": run_id,
             "attempt": attempt,
+            "repository_id": repository_id,
             "environment": environment,
             "target": target,
             "sha": trusted,
@@ -202,7 +225,7 @@ class Gate:
         item = self.store.approval(caller["run"])
         if not item or int(item["expires"]) <= self.now():
             return None
-        for field in ("environment", "sha", "actor_id"):
+        for field in ("repository_id", "environment", "sha", "actor_id"):
             if item.get(field) != caller[field]:
                 return None
         return item
@@ -249,6 +272,7 @@ class Gate:
         self.store.approve(
             caller["run"],
             {
+                "repository_id": caller["repository_id"],
                 "environment": caller["environment"],
                 "sha": caller["sha"],
                 "actor": caller["actor"],
@@ -268,11 +292,17 @@ class Gate:
                 "this run attempt has no approval (a re-run needs its own): "
                 "start a new run with a new code",
             )
-        credentials = self.assume_role(
-            caller["target"]["role_arn"],
-            f"github-{caller['run_id']}-{caller['attempt']}",
-            SESSION_SECONDS,
-        )
+        role_arn = caller["target"]["role_arn"]
+        try:
+            credentials = self.assume_role(role_arn, f"github-{caller['run_id']}-{caller['attempt']}", SESSION_SECONDS)
+        except RoleNotAssumable as error:
+            # a role that was just added, before the stack that owns it was applied
+            raise Refused(
+                403,
+                f"the gate cannot hand out {role_arn.rsplit('/', 1)[-1]} ({error}): the role has to trust "
+                "the gate's role, which the apply of the stack that owns the role does",
+                reason=f"cannot assume the role: {error}",
+            )
         self.record("credentials", claims)
         return {"ok": True, "credentials": credentials}
 
@@ -347,6 +377,7 @@ _gate = None
 
 def _aws_gate():
     import boto3  # in the Lambda runtime; the tests never get here
+    from botocore.exceptions import ClientError
 
     region = os.environ["AWS_REGION"]
     secrets = boto3.client("secretsmanager")
@@ -360,7 +391,10 @@ def _aws_gate():
             return None
 
     def assume_role(role_arn, session_name, seconds):
-        c = sts.assume_role(RoleArn=role_arn, RoleSessionName=session_name, DurationSeconds=seconds)["Credentials"]
+        try:
+            c = sts.assume_role(RoleArn=role_arn, RoleSessionName=session_name, DurationSeconds=seconds)["Credentials"]
+        except ClientError as error:
+            raise RoleNotAssumable(error.response["Error"]["Code"])
         return {
             "AccessKeyId": c["AccessKeyId"],
             "SecretAccessKey": c["SecretAccessKey"],
@@ -370,11 +404,11 @@ def _aws_gate():
 
     config = {
         "audience": os.environ["AUDIENCE"],
-        "repository_id": os.environ["REPOSITORY_ID"],
         "repository_owner_id": os.environ["REPOSITORY_OWNER_ID"],
         "ref": os.environ["REF"],
         "max_failures": int(os.environ["MAX_FAILURES"]),
-        "targets": json.loads(os.environ["TARGETS"]),
+        # repository id -> {"name", "targets": {environment -> {"role_arn", "right", "approval_seconds"}}}
+        "repositories": json.loads(os.environ["REPOSITORIES"]),
     }
     store = Store(boto3.resource("dynamodb").Table(os.environ["TABLE"]))
     return Gate(store, read_secret, assume_role, config)

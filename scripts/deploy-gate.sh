@@ -20,16 +20,20 @@
 #                                     for a run of theirs that is under way
 #   deploy-gate.sh reset <github user>  let someone in again after too many wrong codes
 #
-# What may run.
+# What may run. The gate serves this repository and the ones bootstrap adds
+# (var.deploy_gate_repositories); each has its own trusted commit.
 #   deploy-gate.sh trust [commit]     let workflow runs of this commit (default: the
 #                                     head of origin/main) ask for credentials, after
-#                                     showing what changed since the trusted one
-#   deploy-gate.sh status             trusted commit, who is enrolled, approved runs
+#                                     showing what changed since the trusted one.
+#                                     For the repository you are in: cd into a clone
+#                                     of another one to trust that one
+#   deploy-gate.sh status             trusted commits, who is enrolled, approved runs
 set -euo pipefail
 
 TABLE=${DEPLOY_GATE_TABLE:-postiz-deploy-gate}
 SECRET_PREFIX=${DEPLOY_GATE_SECRET_PREFIX:-postiz/deploy-gate/totp/}
 GATE_ROLE=${DEPLOY_GATE_ROLE:-postiz-deploy-gate}
+GATE_FUNCTION=${DEPLOY_GATE_FUNCTION:-postiz-deploy-gate}
 GITHUB_API=${GITHUB_API:-https://api.github.com}
 export AWS_REGION=${AWS_REGION:-us-east-2} AWS_PAGER=""
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -44,8 +48,19 @@ item() { # key -> the item as DynamoDB JSON, "null" when there is none
     --key "{\"id\":{\"S\":\"$1\"}}" --query Item --output json
 }
 
-trusted() {
-  item config | jq -r '.trusted_sha.S // empty'
+# The repositories the gate serves, as it is configured right now:
+# {"<repository id>": {"name": "owner/name", ...}}
+repositories() {
+  local served
+  served=$(aws lambda get-function-configuration --function-name "$GATE_FUNCTION" \
+    --query Environment.Variables.REPOSITORIES --output text)
+  jq -e 'type == "object"' <<< "$served" > /dev/null 2>&1 \
+    || fail "The gate's function does not say which repositories it serves: terraform -chdir=bootstrap apply"
+  echo "$served"
+}
+
+trusted() { # repository id -> its trusted commit, empty when there is none
+  item "trust#$1" | jq -r '.trusted_sha.S // empty'
 }
 
 # --- people -------------------------------------------------------------------
@@ -207,24 +222,41 @@ revoke() {
 }
 
 trust() {
-  local new old head
-  git -C "$ROOT" fetch --quiet origin main
-  head=$(git -C "$ROOT" rev-parse origin/main)
-  new=$(git -C "$ROOT" rev-parse --verify --quiet "${1:-$head}^{commit}") || fail "no such commit: ${1:-}"
-  old=$(trusted)
+  # the repository you are in, which has to be one the gate serves
+  local repo name served id
+  repo=$(git rev-parse --show-toplevel 2> /dev/null) || fail "Run this inside a clone of the repository whose commit you trust."
+  name=$(git -C "$repo" remote get-url origin | sed -E 's#\.git/?$##; s#^.*github\.com[:/]##')
+  served=$(repositories)
+  id=$(jq -er --arg name "$name" 'to_entries[] | select((.value.name | ascii_downcase) == ($name | ascii_downcase)) | .key' <<< "$served") \
+    || fail "The gate does not serve $name (the origin of $repo). It serves: $(jq -r '[.[].name] | join(", ")' <<< "$served")"
+  name=$(jq -r --arg id "$id" '.[$id].name' <<< "$served")
 
+  local new old head
+  git -C "$repo" fetch --quiet origin main
+  head=$(git -C "$repo" rev-parse origin/main)
+  new=$(git -C "$repo" rev-parse --verify --quiet "${1:-$head}^{commit}") || fail "no such commit: ${1:-}"
+  old=$(trusted "$id")
+
+  echo "Repository: $name"
   if [ "$old" = "$new" ]; then
-    echo "${new:0:12} is already the trusted commit."
+    echo "${new:0:12} is already its trusted commit."
     return
   fi
+  # While the gate served one repository its trusted commit was the item
+  # "config". The gate no longer reads it; here it still says what to compare with.
   if [ -z "$old" ]; then
-    echo "No commit is trusted yet."
-  elif git -C "$ROOT" cat-file -e "$old^{commit}" 2> /dev/null; then
+    old=$(item config | jq -r '.trusted_sha.S // empty')
+    git -C "$repo" cat-file -e "$old^{commit}" 2> /dev/null || old=""
+  fi
+  if [ -z "$old" ]; then
+    echo "No commit of it is trusted yet. Its workflows, scripts and Terraform at ${new:0:12}"
+    echo "will run with production credentials: read them before you answer."
+  elif git -C "$repo" cat-file -e "$old^{commit}" 2> /dev/null; then
     echo "Trusted now: ${old:0:12}. Changes up to ${new:0:12}:"
     echo
-    git -C "$ROOT" --no-pager log --format='  %h %an, %ad: %s' --date=short "$old..$new"
+    git -C "$repo" --no-pager log --format='  %h %an, %ad: %s' --date=short "$old..$new"
     echo
-    git -C "$ROOT" --no-pager diff --stat "$old" "$new"
+    git -C "$repo" --no-pager diff --stat "$old" "$new"
     echo
     echo "Read them before you answer: git diff ${old:0:12} ${new:0:12}"
     echo "Workflows, scripts and Terraform of this commit will run with production credentials."
@@ -236,21 +268,25 @@ trust() {
   fi
 
   local answer
-  read -r -p "Trust ${new:0:12}? Type yes: " answer
+  read -r -p "Trust ${new:0:12} of $name? Type yes: " answer
   [ "$answer" = yes ] || fail "Nothing changed."
-  aws dynamodb put-item --table-name "$TABLE" --item "$(jq -nc --arg sha "$new" \
-    --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{id: {S: "config"}, trusted_sha: {S: $sha}, trusted_at: {S: $at}}')"
-  echo "Trusted: $new"
+  aws dynamodb put-item --table-name "$TABLE" --item "$(jq -nc --arg id "trust#$id" --arg sha "$new" --arg name "$name" \
+    --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{id: {S: $id}, repository: {S: $name}, trusted_sha: {S: $sha}, trusted_at: {S: $at}}')"
+  echo "Trusted: $new of $name"
 }
 
 status() {
-  local config
-  config=$(item config)
-  if [ "$config" = null ] || [ -z "$config" ]; then
-    echo "trusted commit:  none (deploy-gate.sh trust)"
-  else
-    echo "trusted commit:  $(jq -r '.trusted_sha.S' <<< "$config") since $(jq -r '.trusted_at.S' <<< "$config")"
-  fi
+  local served id trust
+  served=$(repositories)
+  echo "trusted commits:"
+  for id in $(jq -r 'to_entries | sort_by(.value.name) | .[].key' <<< "$served"); do
+    trust=$(item "trust#$id")
+    if [ "$trust" = null ] || [ -z "$trust" ]; then
+      echo "  $(jq -r --arg id "$id" '.[$id].name' <<< "$served"): none (deploy-gate.sh trust, in a clone of it)"
+    else
+      echo "  $(jq -r --arg id "$id" '.[$id].name' <<< "$served"): $(jq -r '.trusted_sha.S' <<< "$trust") since $(jq -r '.trusted_at.S' <<< "$trust")"
+    fi
+  done
   echo "who may start runs:"
   people | jq -r 'if length == 0 then "  nobody (deploy-gate.sh enroll <github user>)" else sort_by(.login.S | ascii_downcase) | .[] |
       ([.environments.L[]?.S] | if index("production") then "deploy and terraform apply" elif index("deploy") then "deploy" else "nothing" end) as $may |
