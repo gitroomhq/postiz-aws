@@ -170,11 +170,16 @@ module "guardduty" {
     # through Systems Manager on every EC2 instance, so on each new ECS host too,
     # and on the Elasticsearch host. The agent is capped at a tenth of the host's
     # CPU and 1 GiB of memory (256 MiB on the Elasticsearch host), and sees every
-    # container on an ECS host. GuardDuty also creates a VPC endpoint and its
-    # security group for the agent: they are GuardDuty's, not Terraform's. A host
-    # tagged GuardDutyManaged=false is left alone.
-    # Not the Fargate tasks of the internal apps: there the agent is a sidecar
-    # in every task, which their task definitions do not leave memory for.
+    # container on an ECS host. The agent reports over a link-local address:
+    # GuardDuty adds a route for it (169.254.170.248/29 and fd00:ec2:6d00::/64,
+    # target "GuardDuty") to every route table of the VPC. Those routes are
+    # GuardDuty's, not Terraform's, and cannot be deleted; there is no VPC
+    # endpoint. A host tagged GuardDutyManaged=false is left alone.
+    # Not the Fargate tasks of the internal apps (ECS_FARGATE_AGENT_MANAGEMENT):
+    # there the agent is a sidecar in every task, inside the task's own CPU and
+    # memory, and each service needs a new deployment to get it. So GuardDuty's
+    # Runtime coverage page shows the cluster as unhealthy, with every host
+    # covered and those services listed as "agent not provisioned".
     RUNTIME_MONITORING = {
       status = local.guardduty_runtime
       additional = {
