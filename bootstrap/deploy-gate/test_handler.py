@@ -7,6 +7,8 @@ import handler
 import totp
 
 SECRET = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"  # "12345678901234567890", the RFC 6238 test key
+OTHER_SECRET = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
+ME, COLLEAGUE, STRANGER = "1001", "2002", "3003"  # GitHub user ids
 TRUSTED = "a" * 40
 OTHER = "b" * 40
 CONFIG = {
@@ -25,25 +27,35 @@ CONFIG = {
 class FakeStore:
     def __init__(self, trusted=TRUSTED):
         self.trusted = trusted
-        self.fails = 0
-        self.last_step = None
+        self.users = {
+            ME: {"login": "someone", "environments": ["deploy", "production"]},
+            COLLEAGUE: {"login": "colleague", "environments": ["deploy"]},
+        }
         self.approvals = {}
 
     def trusted_sha(self):
         return self.trusted
 
-    def failures(self):
-        return self.fails
+    def user(self, actor_id):
+        item = self.users.get(actor_id)
+        return dict(item) if item else None
 
-    def record_failure(self):
-        self.fails += 1
-        return self.fails
+    def record_failure(self, actor_id):
+        if actor_id not in self.users:
+            return None
+        user = self.users[actor_id]
+        user["failures"] = user.get("failures", 0) + 1
+        return user["failures"]
 
-    def accept_step(self, step, max_failures):
-        if self.fails >= max_failures or (self.last_step is not None and self.last_step >= step):
+    def accept_step(self, actor_id, step, max_failures):
+        user = self.users.get(actor_id)
+        if user is None or user.get("failures", 0) >= max_failures or user.get("last_step", -1) >= step:
             return False
-        self.last_step, self.fails = step, 0
+        user["last_step"], user["failures"] = step, 0
         return True
+
+    def fails(self, actor_id=ME):
+        return self.users[actor_id].get("failures", 0)
 
     def approval(self, run):
         return self.approvals.get(run)
@@ -63,8 +75,9 @@ class GateTest(unittest.TestCase):
             self.assumed.append((role_arn, session_name, seconds))
             return {"AccessKeyId": "ASIA", "SecretAccessKey": "s", "SessionToken": "t", "Expiration": "2027-01-15T08:00:00Z"}
 
+        self.secrets = {ME: SECRET, COLLEAGUE: OTHER_SECRET}
         self.gate = handler.Gate(
-            self.store, lambda: SECRET, assume_role, CONFIG, now=lambda: self.clock, log=self.events.append
+            self.store, self.secrets.get, assume_role, CONFIG, now=lambda: self.clock, log=self.events.append
         )
 
     def claims(self, **changes):
@@ -81,6 +94,7 @@ class GateTest(unittest.TestCase):
             "sha": TRUSTED,
             "workflow_sha": TRUSTED,
             "actor": "someone",
+            "actor_id": ME,
         }
         claims.update(changes)
         return {k: v for k, v in claims.items() if v is not None}
@@ -94,8 +108,11 @@ class GateTest(unittest.TestCase):
         response = handler.handle(self.gate, event)
         return response["statusCode"], json.loads(response["body"])
 
-    def code(self, offset=0):
-        return totp.code_at(SECRET, self.clock // 30 + offset)
+    def code(self, offset=0, secret=SECRET):
+        return totp.code_at(secret, self.clock // 30 + offset)
+
+    def colleague(self, **changes):
+        return self.claims(actor="colleague", actor_id=COLLEAGUE, **changes)
 
     def open(self, **claims):
         return self.call("open", self.claims(**claims), {"code": self.code()})
@@ -152,7 +169,7 @@ class GateTest(unittest.TestCase):
         self.assertEqual(self.open()[0], 200)
         status, body = self.call("open", body={"code": "000000"})
         self.assertEqual((status, body["ok"]), (200, True))
-        self.assertEqual(self.store.fails, 0)
+        self.assertEqual(self.store.fails(), 0)
 
     def test_a_rerun_needs_its_own_approval(self):
         self.open()
@@ -176,14 +193,14 @@ class GateTest(unittest.TestCase):
         for bad in ("", "12345", "1234567", "abcdef", None, 12):
             status, _ = self.call("open", body={"code": bad})
             self.assertEqual(status, 400, bad)
-        self.assertEqual(self.store.fails, 0)
+        self.assertEqual(self.store.fails(), 0)
 
     def test_a_code_that_is_too_old_is_refused_without_counting(self):
         for offset in (-3, -60, -120):
             status, body = self.call("open", body={"code": self.code(offset)})
             self.assertEqual(status, 403, offset)
             self.assertIn("expired", body["message"])
-        self.assertEqual((self.store.fails, self.store.approvals), (0, {}))
+        self.assertEqual((self.store.fails(), self.store.approvals), (0, {}))
 
     # --- wrong codes -----------------------------------------------------------
 
@@ -191,21 +208,25 @@ class GateTest(unittest.TestCase):
         recent = {self.code(offset) for offset in range(-handler.EXPIRED_STEPS, 2)}
         return next(c for c in ("000000", "111111", "222222", "333333") if c not in recent)
 
-    def test_wrong_codes_lock_the_gate_also_for_the_right_code(self):
+    def test_wrong_codes_lock_that_person_out_also_with_the_right_code(self):
         for n in range(1, 6):
             status, body = self.call("open", body={"code": self.wrong()})
             self.assertEqual(status, 403)
-        self.assertIn("locked", body["message"])
+        self.assertIn("locked out", body["message"])
+        self.assertIn("reset someone", body["message"])
         status, body = self.open()
         self.assertEqual(status, 423)
         self.assertEqual(self.store.approvals, {})
-        self.assertEqual(self.store.fails, 5)  # a locked gate counts nothing more
+        self.assertEqual(self.store.fails(), 5)  # someone locked out is counted no further
+        # everyone else goes on
+        status, _ = self.call("open", self.colleague(run_id="900"), {"code": self.code(secret=OTHER_SECRET)})
+        self.assertEqual(status, 200)
 
     def test_a_right_code_clears_earlier_mistakes(self):
         for _ in range(4):
             self.call("open", body={"code": self.wrong()})
         self.assertEqual(self.open()[0], 200)
-        self.assertEqual(self.store.fails, 0)
+        self.assertEqual(self.store.fails(), 0)
 
     # --- who may ask -----------------------------------------------------------
 
@@ -227,14 +248,14 @@ class GateTest(unittest.TestCase):
             for route in ("open", "credentials"):
                 status, _ = self.call(route, self.claims(**change), {"code": self.code()})
                 self.assertEqual(status, 403, (route, change))
-        self.assertEqual((self.store.fails, self.store.approvals, self.assumed), (0, {}, []))
+        self.assertEqual((self.store.fails(), self.store.approvals, self.assumed), (0, {}, []))
 
     def test_only_the_trusted_commit(self):
         for change in ({"sha": OTHER, "workflow_sha": OTHER}, {"sha": OTHER}, {"workflow_sha": OTHER}, {"sha": None, "workflow_sha": None}):
             status, body = self.call("open", self.claims(**change), {"code": self.code()})
             self.assertEqual(status, 403, change)
             self.assertIn("deploy-gate.sh trust", body["message"])
-        self.assertEqual(self.store.last_step, None)  # the code was not used up
+        self.assertNotIn("last_step", self.store.users[ME])  # the code was not used up
 
     def test_a_token_with_only_sha_is_enough(self):
         self.assertEqual(self.open(workflow_sha=None)[0], 200)
@@ -250,6 +271,72 @@ class GateTest(unittest.TestCase):
         self.store.trusted = OTHER
         self.assertEqual(self.call("credentials")[0], 403)
         self.assertEqual(self.call("credentials", self.claims(sha=OTHER, workflow_sha=OTHER))[0], 403)
+
+    # --- one authenticator per person --------------------------------------------
+
+    def test_someone_without_an_authenticator_is_refused_and_nothing_is_counted(self):
+        for change in ({"actor": "stranger", "actor_id": STRANGER}, {"actor_id": None}, {"actor_id": "x"}, {"actor_id": ""}):
+            for route in ("open", "credentials"):
+                status, body = self.call(route, self.claims(**change), {"code": self.code()})
+                self.assertEqual(status, 403, (route, change))
+                self.assertIn("has no authenticator", body["message"])
+        self.assertEqual(set(self.store.users), {ME, COLLEAGUE})  # no item was made for them
+        self.assertEqual((self.store.fails(), self.store.fails(COLLEAGUE), self.store.approvals), (0, 0, {}))
+
+    def test_a_code_only_opens_runs_its_owner_started(self):
+        # my code on a run my colleague started: wrong, and it counts against them
+        status, body = self.call("open", self.colleague(), {"code": self.code()})
+        self.assertEqual(status, 403)
+        self.assertIn("wrong code", body["message"])
+        self.assertEqual((self.store.fails(COLLEAGUE), self.store.fails()), (1, 0))
+        # their own code opens it, and my code is still unused
+        self.assertEqual(self.call("open", self.colleague(), {"code": self.code(secret=OTHER_SECRET)})[0], 200)
+        self.assertEqual(self.open(run_id="778")[0], 200)
+
+    def test_each_person_has_their_environments(self):
+        code = self.code(secret=OTHER_SECRET)
+        status, body = self.call("open", self.colleague(environment="production"), {"code": code})
+        self.assertEqual(status, 403)
+        self.assertIn("may not start runs in the production environment", body["message"])
+        self.assertEqual(self.store.fails(COLLEAGUE), 0)
+        self.assertEqual(self.call("open", self.colleague(), {"code": code})[0], 200)  # deploy is theirs
+
+    def test_removing_someone_ends_their_running_approval(self):
+        self.assertEqual(self.call("open", self.colleague(), {"code": self.code(secret=OTHER_SECRET)})[0], 200)
+        self.assertEqual(self.call("credentials", self.colleague())[0], 200)
+        del self.store.users[COLLEAGUE]
+        self.assertEqual(self.call("credentials", self.colleague())[0], 403)
+
+    def test_taking_an_environment_away_ends_the_approval_for_it(self):
+        self.open(environment="production")
+        self.store.users[ME]["environments"] = ["deploy"]
+        self.assertEqual(self.call("credentials", self.claims(environment="production"))[0], 403)
+
+    def test_an_approval_belongs_to_who_started_the_run(self):
+        self.open()
+        # the same run cannot come from someone else; if a token said so, it gets nothing
+        self.assertEqual(self.call("credentials", self.colleague())[0], 403)
+
+    def test_someone_removed_during_a_request_is_not_brought_back(self):
+        def read_and_remove(actor_id):
+            secret = self.secrets.get(actor_id)
+            del self.store.users[actor_id]
+            return secret
+
+        self.gate.read_secret = read_and_remove
+        for code in (self.wrong(), self.code()):
+            self.store.users[ME] = {"login": "someone", "environments": ["deploy"]}
+            status, _ = self.call("open", body={"code": code})
+            self.assertEqual(status, 403)
+            self.assertNotIn(ME, self.store.users)
+        self.assertEqual(self.store.approvals, {})
+
+    def test_an_authenticator_that_was_never_stored(self):
+        del self.secrets[ME]
+        status, body = self.open()
+        self.assertEqual(status, 403)
+        self.assertIn("never stored", body["message"])
+        self.assertEqual(self.store.fails(), 0)
 
     # --- plumbing --------------------------------------------------------------
 
@@ -291,6 +378,7 @@ class GateTest(unittest.TestCase):
         self.call("credentials")
         first, second, third = self.logged()
         self.assertEqual((first["event"], first["repository"], first["actor"], first["status"]), ("refused", "evil/fork", "mallory", 403))
+        self.assertEqual(first["actor_id"], ME)
         self.assertIn("repository_id", first["reason"])
         self.assertEqual((second["sha"], second["workflow_sha"], second["route"]), (OTHER, OTHER, "POST /open"))
         self.assertIn("trusted", second["reason"])

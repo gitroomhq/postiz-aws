@@ -162,34 +162,60 @@ terraform -chdir=environments/production init -backend-config=backend.hcl
 Nothing in GitHub can change production on its own. The two roles that can, the
 admin role of `terraform apply` and the deploy role, do not trust GitHub. They
 trust one Lambda function, the deploy gate (`bootstrap/deploy-gate.tf`), and it
-gives a workflow run one hour of credentials only when both of these hold:
+gives a workflow run one hour of credentials only when all of these hold:
 
 - **A code.** The run was started by hand with a 6-digit code from an
   authenticator app (the workflow's `otp` input). A code works once, for about a
-  minute, and five wrong ones lock the gate.
+  minute.
+- **Of the person who started the run.** Everyone who may deploy has their own
+  authenticator, tied to their GitHub account: a code only opens runs its owner
+  started, and five wrong ones lock out that person and nobody else.
 - **A trusted commit.** The run is on `main` of this repository, at the commit
   you last approved from your own machine with `scripts/deploy-gate.sh trust`.
 
-So a stolen GitHub account or token gets no credentials. A changed workflow,
-script or Terraform file is a new commit, which the gate refuses until someone
-with admin credentials for the account has trusted it; the trusted workflows do
-nothing without a code; and deleting the check from a workflow removes nothing,
-because the check is in AWS. `bootstrap/` is applied by hand and never by CI, so
-a pull request cannot change the gate either.
+So a stolen GitHub account or token gets no credentials, and neither does a
+stolen phone without its owner's GitHub account. A changed workflow, script or
+Terraform file is a new commit, which the gate refuses until someone with admin
+credentials for the account has trusted it; the trusted workflows do nothing
+without a code; and deleting the check from a workflow removes nothing, because
+the check is in AWS. `bootstrap/` is applied by hand and never by CI, so a pull
+request cannot change the gate either.
 
 | When | What you do |
 |---|---|
 | Every deploy, every `terraform apply`, every ops image build | Run the workflow by hand and type the code. Each run needs a new one |
 | After every new commit on this repository's `main` | `scripts/deploy-gate.sh trust`: it lists the commits and files changed since the trusted commit and asks before it moves. Read the change first: this is the review the gate relies on |
 | A run was refused | The job log says why: a wrong, used or expired code, a commit that is not trusted, or a re-run (a re-run is a new attempt with the old code, so start a new run). A run that waits behind another deploy starts with an expired code: start it when the other one is done |
-| The gate is locked | `scripts/deploy-gate.sh reset`, after looking at who sent the wrong codes: `aws logs tail /aws/lambda/postiz-deploy-gate --since 1d` |
+| Someone is locked out | `scripts/deploy-gate.sh reset <github user>`, after looking at where the wrong codes came from: `aws logs tail /aws/lambda/postiz-deploy-gate --since 1d`. If it was not them, someone has their GitHub account: `revoke` instead |
 | Did anyone try to get past it | `aws logs tail /aws/lambda/postiz-deploy-gate --since 7d --filter-pattern refused`: every refusal with the repository, branch, commit, run and person GitHub's token names. A refused run at a commit you do not know is someone changing the workflows |
-| New phone, lost phone | `scripts/deploy-gate.sh enroll --rotate` |
-| What is trusted, who is approved | `scripts/deploy-gate.sh status` |
+| Someone new should deploy | `scripts/deploy-gate.sh enroll <github user>`, in your own terminal, see below |
+| New phone, lost phone | `scripts/deploy-gate.sh enroll <github user> --rotate`: the old entry stops working |
+| Someone leaves, or their GitHub account or phone may be in other hands | `scripts/deploy-gate.sh revoke <github user>`: from the next request on, also for a run of theirs that is under way |
+| What is trusted, who may start runs, what is approved | `scripts/deploy-gate.sh status` |
 
 `scripts/deploy-gate.sh` needs admin credentials for the account
 (`export AWS_PROFILE=<profile>`), which is the point: trusting a commit,
 unlocking and enrolling cannot be done from GitHub.
+
+**Who may deploy.** Someone who deploys needs two things: write access to this
+repository, to start a workflow, and an authenticator from `enroll`. They need
+no AWS access. Write access alone changes nothing in production, and what they
+push here runs only after `trust`.
+
+```
+scripts/deploy-gate.sh enroll <github user>           # may deploy and build the ops image
+scripts/deploy-gate.sh enroll <github user> --apply   # may also run terraform apply
+scripts/deploy-gate.sh grant <github user> deploy|apply   # change that later, same authenticator
+```
+
+`enroll` shows that person's secret once, as a QR code when `qrencode` is
+installed, and stores it only after a code from their phone proves they have
+it. Let them scan your screen, or give them the setup key over a channel you
+trust; whoever sees it can make their codes, though only that person's GitHub
+account can spend them. The gate knows people by GitHub's numeric user id, so
+renaming an account changes nothing and a freed name gives the next owner
+nothing. A code deploys what postiz-app's `main` holds and applies what this
+repository's trusted commit holds, nothing else, whoever types it.
 
 What the gate does not do:
 
@@ -205,18 +231,19 @@ token and the function decides on what it says (`bootstrap/deploy-gate/handler.p
 the first job of a run sends the code and gets that run attempt approved, for 90
 minutes in the `deploy` environment and two hours in `production`; every later
 job gets credentials for the role of its environment while the approval lasts.
-The function logs every decision, refusals included, with the run that asked,
-never a code or a credential. The
-authenticator secret is created by `enroll` on your machine and stored where only
-the function can read it; it is in no Terraform state.
+The token also names who started the run, and the code is checked against that
+person's secret. The function logs every decision, refusals included, with the
+run that asked, never a code or a credential. A secret is created by `enroll`
+on your machine and stored where only the function can read it, one Secrets
+Manager secret per person; none is in a Terraform state.
 
 **Setting it up** (once, in this order, so that nothing is locked out):
 
 1. `terraform -chdir=bootstrap init && terraform -chdir=bootstrap apply` creates
    the gate. From this moment GitHub can no longer assume the apply role.
-2. `scripts/deploy-gate.sh enroll`, in your own terminal: it shows the secret
-   once, as a QR code when `qrencode` is installed, and checks a code from your
-   phone before it stores anything.
+2. `scripts/deploy-gate.sh enroll <your github user> --apply`, in your own
+   terminal: it shows the secret once, as a QR code when `qrencode` is
+   installed, and checks a code from your phone before it stores anything.
 3. Set the repository variable `DEPLOY_GATE_URL` to
    `terraform -chdir=bootstrap output -raw deploy_gate_url`.
 4. With the workflows of this version on `main`: `scripts/deploy-gate.sh trust`.

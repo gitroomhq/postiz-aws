@@ -93,7 +93,8 @@ A fork also sets `TF_VAR_github_repository`, `TF_VAR_github_oidc_subject`,
 `gh api repos/<owner>/<name>/actions/oidc/customization/sub --jq .sub_claim_prefix`
 prints: repositories created since July 2026 put the owner and repository ids in it.
 The two ids are what `gh api repos/<owner>/<name> --jq '.id, .owner.id'` prints.
-Then enroll your authenticator with `scripts/deploy-gate.sh enroll`: every apply
+Then enroll your authenticator with
+`scripts/deploy-gate.sh enroll <your github user> --apply`: every apply
 and deploy below needs a code from it, see the README's
 [Deploy gate](../README.md#deploy-gate).
 Then create `environments/production/backend.hcl` from `backend.hcl.example`
