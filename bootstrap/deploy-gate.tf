@@ -8,19 +8,22 @@
 #   - the run's GitHub token says: this repository, a manual run on main, at the
 #     trusted commit (scripts/deploy-gate.sh trust, run with admin credentials
 #     after reading what changed), in the GitHub environment of the role
-#   - the run attempt was approved with a 6-digit code (workflow input "otp") that
-#     was not used before; five wrong codes lock the gate until
-#     scripts/deploy-gate.sh reset
+#   - the person who started the run was given an authenticator and that
+#     environment (scripts/deploy-gate.sh enroll <github user>); the gate knows
+#     them by GitHub's numeric user id
+#   - the run attempt was approved with a 6-digit code (workflow input "otp") of
+#     that person's authenticator that was not used before; five wrong codes lock
+#     that person out until scripts/deploy-gate.sh reset <github user>
 #
 # So a stolen GitHub account or token gets no credentials: a changed workflow is a
 # new commit, which the gate refuses, and the trusted workflow does nothing
-# without a code. Removing the check from a workflow removes nothing, the check is
-# here.
+# without a code. A stolen phone opens nothing without its owner's GitHub
+# account. Removing the check from a workflow removes nothing, the check is here.
 #
 # This stack is applied by hand and CI never applies it, so the gate is not
-# something a pull request can change. The authenticator secret is written by
-# scripts/deploy-gate.sh enroll and never by Terraform: it is in no state file,
-# and only the function can read it.
+# something a pull request can change. The authenticator secrets, one per person,
+# are written by scripts/deploy-gate.sh enroll and never by Terraform: they are in
+# no state file, and only the function can read them.
 #
 # An HTTP API with a JWT authorizer is in front of the function: API Gateway
 # verifies the GitHub token's signature, issuer, audience and dates, and the
@@ -29,6 +32,12 @@
 
 locals {
   gate_name = "postiz-deploy-gate"
+
+  # One Secrets Manager secret per person, <prefix><GitHub user id>, created by
+  # scripts/deploy-gate.sh enroll with a resource policy that denies reading the
+  # value to everyone but the gate: read-only roles, the roles the gate hands
+  # out and admins included.
+  gate_secret_prefix = "postiz/deploy-gate/totp/"
 
   # GitHub environment of the job -> the role its credentials are for, and how
   # long one code keeps that run going. Credentials last an hour whatever this
@@ -63,38 +72,6 @@ resource "aws_dynamodb_table" "deploy_gate" {
     attribute_name = "ttl"
     enabled        = true
   }
-}
-
-# --- the authenticator secret -------------------------------------------------
-
-resource "aws_secretsmanager_secret" "deploy_gate_totp" {
-  name        = "postiz/deploy-gate/totp"
-  description = "Authenticator secret of the deploy gate. Written by scripts/deploy-gate.sh enroll, read only by the gate."
-}
-
-# Whatever a role is allowed elsewhere, only the gate reads the value: not the
-# read-only roles, not the roles the gate hands out, not an admin.
-data "aws_iam_policy_document" "deploy_gate_totp" {
-  statement {
-    sid       = "OnlyTheGateReadsTheValue"
-    effect    = "Deny"
-    actions   = ["secretsmanager:GetSecretValue"]
-    resources = [aws_secretsmanager_secret.deploy_gate_totp.arn]
-    principals {
-      type        = "*"
-      identifiers = ["*"]
-    }
-    condition {
-      test     = "ArnNotEquals"
-      variable = "aws:PrincipalArn"
-      values   = [aws_iam_role.deploy_gate.arn]
-    }
-  }
-}
-
-resource "aws_secretsmanager_secret_policy" "deploy_gate_totp" {
-  secret_arn = aws_secretsmanager_secret.deploy_gate_totp.arn
-  policy     = data.aws_iam_policy_document.deploy_gate_totp.json
 }
 
 # --- the function ---------------------------------------------------------------
@@ -137,9 +114,9 @@ data "aws_iam_policy_document" "deploy_gate" {
   }
 
   statement {
-    sid       = "ReadTheAuthenticatorSecret"
+    sid       = "ReadTheAuthenticatorSecrets"
     actions   = ["secretsmanager:GetSecretValue"]
-    resources = [aws_secretsmanager_secret.deploy_gate_totp.arn]
+    resources = ["arn:aws:secretsmanager:${var.region}:${var.aws_account_id}:secret:${local.gate_secret_prefix}*"]
   }
 
   statement {
@@ -161,8 +138,8 @@ resource "aws_iam_role_policy" "deploy_gate" {
   policy = data.aws_iam_policy_document.deploy_gate.json
 }
 
-# Every decision is one JSON line: opened, credentials, refused, locked, with the
-# run, the commit and who started it. Never a code or a credential.
+# Every decision is one JSON line: opened, credentials, refused, expired, locked,
+# with the run, the commit and who started it. Never a code or a credential.
 resource "aws_cloudwatch_log_group" "deploy_gate" {
   name              = "/aws/lambda/${local.gate_name}"
   retention_in_days = 400
@@ -183,7 +160,7 @@ resource "aws_lambda_function" "deploy_gate" {
   environment {
     variables = {
       TABLE               = aws_dynamodb_table.deploy_gate.name
-      SECRET_ID           = aws_secretsmanager_secret.deploy_gate_totp.arn
+      SECRET_PREFIX       = local.gate_secret_prefix
       AUDIENCE            = var.deploy_gate_audience
       REPOSITORY_ID       = var.github_repository_id
       REPOSITORY_OWNER_ID = var.github_repository_owner_id

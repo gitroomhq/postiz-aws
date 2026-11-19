@@ -7,13 +7,16 @@ repository can get such a token, so everything else is decided here, from the
 token's claims:
 
   POST /open         {"code": "123456"}  approve this run attempt with a code from
-                     the authenticator
+                     the authenticator of the person who started the run
   POST /credentials  one hour of credentials for the role of the job's GitHub
                      environment, only for an approved run attempt
 
 Both need a manual run on the main branch of this repository, at the commit that
-scripts/deploy-gate.sh trust recorded. A code is accepted once, and a few wrong
-ones lock the gate until scripts/deploy-gate.sh reset.
+scripts/deploy-gate.sh trust recorded, started by someone scripts/deploy-gate.sh
+enroll gave an authenticator and that environment. Everyone has their own secret,
+tied to their GitHub account by its numeric id: a code only opens runs its owner
+started. A code is accepted once, and a few wrong ones lock that person out until
+scripts/deploy-gate.sh reset.
 
 The claims are trusted because API Gateway verified the token. Someone who can
 invoke this function directly can make them up: only account admins can.
@@ -39,6 +42,7 @@ LOGGED_CLAIMS = (
     "run_id",
     "run_attempt",
     "actor",
+    "actor_id",
     "job_workflow_ref",
 )
 
@@ -56,7 +60,10 @@ class Refused(Exception):
 
 
 class Store:
-    """The gate's DynamoDB table: three kinds of items under the key "id"."""
+    """The gate's DynamoDB table, three kinds of items under the key "id":
+    "config" (the trusted commit), "user#<GitHub user id>" (someone who may start
+    runs: their environments, wrong codes and last used code) and
+    "run#<run>#<attempt>" (an approval)."""
 
     def __init__(self, table):
         self.table = table
@@ -67,31 +74,40 @@ class Store:
     def trusted_sha(self):
         return (self._get("config") or {}).get("trusted_sha")
 
-    def failures(self):
-        return int((self._get("totp") or {}).get("failures", 0))
+    def user(self, actor_id):
+        return self._get("user#" + actor_id)
 
-    def record_failure(self):
-        result = self.table.update_item(
-            Key={"id": "totp"},
-            UpdateExpression="ADD #failures :one",
-            ExpressionAttributeNames={"#failures": "failures"},
-            ExpressionAttributeValues={":one": 1},
-            ReturnValues="UPDATED_NEW",
-        )
+    # Both updates need the item to exist: an update of a missing item would
+    # create it, and someone removed a moment ago must stay removed.
+
+    def record_failure(self, actor_id):
+        """Counts a wrong code of this user. None when they were removed meanwhile."""
+        try:
+            result = self.table.update_item(
+                Key={"id": "user#" + actor_id},
+                UpdateExpression="ADD #failures :one",
+                ConditionExpression="attribute_exists(#id)",
+                ExpressionAttributeNames={"#id": "id", "#failures": "failures"},
+                ExpressionAttributeValues={":one": 1},
+                ReturnValues="UPDATED_NEW",
+            )
+        except self.table.meta.client.exceptions.ConditionalCheckFailedException:
+            return None
         return int(result["Attributes"]["failures"])
 
-    def accept_step(self, step, max_failures):
-        """Marks a code's step as used. False when this code or a later one was
-        already used, or the gate locked in the meantime."""
+    def accept_step(self, actor_id, step, max_failures):
+        """Marks a code's step as used by this user. False when this code or a later
+        one was already used, or they were locked out or removed in the meantime."""
         try:
             self.table.update_item(
-                Key={"id": "totp"},
+                Key={"id": "user#" + actor_id},
                 UpdateExpression="SET #step = :step, #failures = :zero",
                 ConditionExpression=(
-                    "(attribute_not_exists(#step) OR #step < :step)"
+                    "attribute_exists(#id)"
+                    " AND (attribute_not_exists(#step) OR #step < :step)"
                     " AND (attribute_not_exists(#failures) OR #failures < :max)"
                 ),
-                ExpressionAttributeNames={"#step": "last_step", "#failures": "failures"},
+                ExpressionAttributeNames={"#id": "id", "#step": "last_step", "#failures": "failures"},
                 ExpressionAttributeValues={":step": step, ":zero": 0, ":max": max_failures},
             )
             return True
@@ -153,6 +169,23 @@ class Gate:
                 "review what changed and run scripts/deploy-gate.sh trust",
             )
 
+        # who started the run: GitHub's numeric id, a login can be renamed and reused
+        actor = str(claims.get("actor", "")) or "this account"
+        actor_id = str(claims.get("actor_id", ""))
+        user = self.store.user(actor_id) if actor_id.isdigit() else None
+        if not user:
+            raise Refused(
+                403,
+                f"{actor} has no authenticator for the deploy gate: "
+                f"an admin gives one with scripts/deploy-gate.sh enroll {actor}",
+            )
+        if environment not in (user.get("environments") or ()):
+            raise Refused(
+                403,
+                f"{actor} may not start runs in the {environment} environment: "
+                "an admin changes that with scripts/deploy-gate.sh grant",
+            )
+
         return {
             "run": f"{run_id}#{attempt}",
             "run_id": run_id,
@@ -160,15 +193,18 @@ class Gate:
             "environment": environment,
             "target": target,
             "sha": trusted,
-            "actor": str(claims.get("actor", "")),
+            "actor": actor,
+            "actor_id": actor_id,
+            "failures": int(user.get("failures", 0)),
         }
 
     def valid_approval(self, caller):
         item = self.store.approval(caller["run"])
         if not item or int(item["expires"]) <= self.now():
             return None
-        if item.get("environment") != caller["environment"] or item.get("sha") != caller["sha"]:
-            return None
+        for field in ("environment", "sha", "actor_id"):
+            if item.get(field) != caller[field]:
+                return None
         return item
 
     # --- routes ------------------------------------------------------------
@@ -184,10 +220,16 @@ class Gate:
             raise Refused(400, "the code is the 6 digits the authenticator shows")
 
         max_failures = self.config["max_failures"]
-        if self.store.failures() >= max_failures:
-            raise Refused(423, self._locked(), event="locked")
+        if caller["failures"] >= max_failures:
+            raise Refused(423, self._locked(caller), event="locked")
 
-        secret = self.read_secret()
+        secret = self.read_secret(caller["actor_id"])
+        if not secret:
+            raise Refused(
+                403,
+                f"{caller['actor']}'s authenticator was never stored: "
+                f"scripts/deploy-gate.sh enroll {caller['actor']} --rotate",
+            )
         step = totp.matching_step(secret, code, self.now())
         if step is None:
             # A run that waited (a slow runner, another deploy in front of it) sends
@@ -199,9 +241,9 @@ class Gate:
                     "this code has expired, codes are good for about a minute: start a new run with a new one",
                     event="expired",
                 )
-            raise self._wrong("wrong code")
-        if not self.store.accept_step(step, max_failures):
-            raise self._wrong("this code was already used, wait for the next one")
+            raise self._wrong(caller, "wrong code")
+        if not self.store.accept_step(caller["actor_id"], step, max_failures):
+            raise self._wrong(caller, "this code was already used, wait for the next one")
 
         expires = int(self.now()) + caller["target"]["approval_seconds"]
         self.store.approve(
@@ -210,6 +252,7 @@ class Gate:
                 "environment": caller["environment"],
                 "sha": caller["sha"],
                 "actor": caller["actor"],
+                "actor_id": caller["actor_id"],
                 "expires": expires,
                 "ttl": expires + 30 * 86400,
             },
@@ -239,18 +282,22 @@ class Gate:
         until = time.strftime("%H:%M UTC", time.gmtime(expires))
         return {"ok": True, "message": f"approved: the {caller['environment']} role is open to this run until {until}"}
 
-    def _wrong(self, reason):
-        """Counts a wrong code and says how many are left."""
-        failures = self.store.record_failure()
+    def _wrong(self, caller, reason):
+        """Counts a wrong code of the person who started the run and says how many
+        are left. Only they are locked out, everyone else goes on."""
+        failures = self.store.record_failure(caller["actor_id"])
         max_failures = self.config["max_failures"]
+        if failures is None:  # removed while this request was running
+            return Refused(403, f"{caller['actor']} has no authenticator for the deploy gate", reason=reason)
         if failures >= max_failures:
-            message = f"{reason}. {self._locked()}"
+            message = f"{reason}. {self._locked(caller)}"
         else:
-            message = f"{reason} ({failures} of {max_failures} before the gate locks)"
+            message = f"{reason} ({failures} of {max_failures} before {caller['actor']} is locked out)"
         return Refused(403, message, reason=reason, failures=failures)
 
-    def _locked(self):
-        return "The gate is locked after too many wrong codes: scripts/deploy-gate.sh reset"
+    def _locked(self, caller):
+        actor = caller["actor"]
+        return f"{actor} is locked out after too many wrong codes: an admin runs scripts/deploy-gate.sh reset {actor}"
 
     def record(self, event, claims, **more):
         """One log line for everything the gate decides, refusals included: which
@@ -305,8 +352,12 @@ def _aws_gate():
     secrets = boto3.client("secretsmanager")
     sts = boto3.client("sts", region_name=region, endpoint_url=f"https://sts.{region}.amazonaws.com")
 
-    def read_secret():
-        return secrets.get_secret_value(SecretId=os.environ["SECRET_ID"])["SecretString"]
+    def read_secret(actor_id):
+        # one secret per person, named after their GitHub user id (digits, checked)
+        try:
+            return secrets.get_secret_value(SecretId=os.environ["SECRET_PREFIX"] + actor_id)["SecretString"]
+        except secrets.exceptions.ResourceNotFoundException:
+            return None
 
     def assume_role(role_arn, session_name, seconds):
         c = sts.assume_role(RoleArn=role_arn, RoleSessionName=session_name, DurationSeconds=seconds)["Credentials"]

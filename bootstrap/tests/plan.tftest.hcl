@@ -57,10 +57,14 @@ run "deploy_gate" {
   }
 
   assert {
-    condition = alltrue([
-      for st in data.aws_iam_policy_document.deploy_gate_totp.statement :
-      st.effect == "Deny" && st.actions == toset(["secretsmanager:GetSecretValue"])
-    ])
-    error_message = "only the gate may read the authenticator secret"
+    condition = one([
+      for st in data.aws_iam_policy_document.deploy_gate.statement : st.resources if contains(st.actions, "secretsmanager:GetSecretValue")
+    ]) == toset(["arn:aws:secretsmanager:us-east-2:123456789012:secret:postiz/deploy-gate/totp/*"])
+    error_message = "the gate reads the authenticator secrets, one per person under its prefix, and no other secret"
+  }
+
+  assert {
+    condition     = aws_lambda_function.deploy_gate.environment[0].variables.SECRET_PREFIX == "postiz/deploy-gate/totp/"
+    error_message = "the function looks for the secrets where scripts/deploy-gate.sh enroll puts them"
   }
 }
