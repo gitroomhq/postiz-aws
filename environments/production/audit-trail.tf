@@ -160,17 +160,15 @@ resource "aws_cloudwatch_log_group" "cloudtrail" {
   retention_in_days = local.trail_log_days
 }
 
+# No condition on the trail's ARN here, unlike the bucket policy: AWS documents
+# that key for the bucket, not for this role, and a trail that cannot assume
+# its role is refused at creation. The role can only write to this log group.
 data "aws_iam_policy_document" "cloudtrail_logs_trust" {
   statement {
     actions = ["sts:AssumeRole"]
     principals {
       type        = "Service"
       identifiers = ["cloudtrail.amazonaws.com"]
-    }
-    condition {
-      test     = "StringEquals"
-      variable = "aws:SourceArn"
-      values   = [local.trail_arn]
     }
   }
 }
