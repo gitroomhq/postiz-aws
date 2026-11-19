@@ -4,6 +4,8 @@
 
 variables {
   aws_account_id = "123456789012"
+  # whatever bootstrap/local.auto.tfvars says on this machine
+  deploy_gate_repositories = {}
 }
 
 mock_provider "aws" {
@@ -45,8 +47,13 @@ run "deploy_gate" {
   }
 
   assert {
-    condition     = keys(jsondecode(aws_lambda_function.deploy_gate.environment[0].variables.TARGETS)) == ["deploy", "production"] && jsondecode(aws_lambda_function.deploy_gate.environment[0].variables.TARGETS).deploy.role_arn == "arn:aws:iam::123456789012:role/postiz-production-github-deploy"
-    error_message = "the gate hands out the deploy role to the deploy environment and the apply role to production"
+    condition     = keys(local.gate_repositories) == ["1436140501"] && keys(local.gate_repositories["1436140501"].targets) == ["deploy", "production"] && local.gate_repositories["1436140501"].targets.deploy.role_arn == "arn:aws:iam::123456789012:role/postiz-production-github-deploy"
+    error_message = "by default the gate serves this repository only: the deploy role for the deploy environment and the apply role for production"
+  }
+
+  assert {
+    condition     = local.gate_repositories["1436140501"].targets.deploy.right == "deploy" && local.gate_repositories["1436140501"].targets.production.right == "production"
+    error_message = "terraform apply needs the production right, a deploy the deploy right"
   }
 
   assert {
@@ -67,4 +74,44 @@ run "deploy_gate" {
     condition     = aws_lambda_function.deploy_gate.environment[0].variables.SECRET_PREFIX == "postiz/deploy-gate/totp/"
     error_message = "the function looks for the secrets where scripts/deploy-gate.sh enroll puts them"
   }
+}
+
+run "more_repositories" {
+  command = plan
+
+  variables {
+    deploy_gate_repositories = {
+      "5550001" = {
+        name = "acme/internal"
+        targets = {
+          production = { role_name = "internal-apply", right = "production", approval_seconds = 7200 }
+          deploy-bot = { role_name = "bot-deploy", right = "deploy" }
+        }
+      }
+    }
+  }
+
+  assert {
+    condition     = keys(local.gate_repositories) == ["1436140501", "5550001"] && local.gate_repositories["5550001"].targets["deploy-bot"] == { role_arn = "arn:aws:iam::123456789012:role/bot-deploy", right = "deploy", approval_seconds = 5400 }
+    error_message = "another repository gets its own environments and roles, next to this one's"
+  }
+
+  assert {
+    condition = toset(one([
+      for st in data.aws_iam_policy_document.deploy_gate.statement : st.resources if st.sid == "HandOutTheGatedRoles"
+    ])) == toset(["arn:aws:iam::123456789012:role/postiz-production-github-deploy", "arn:aws:iam::123456789012:role/mock", "arn:aws:iam::123456789012:role/internal-apply", "arn:aws:iam::123456789012:role/bot-deploy"])
+    error_message = "the gate may assume the roles of its targets and no other"
+  }
+}
+
+run "this_repository_cannot_be_redefined" {
+  command = plan
+
+  variables {
+    deploy_gate_repositories = {
+      "1436140501" = { name = "acme/other", targets = { deploy = { role_name = "x", right = "deploy" } } }
+    }
+  }
+
+  expect_failures = [var.deploy_gate_repositories]
 }

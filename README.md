@@ -217,6 +217,17 @@ renaming an account changes nothing and a freed name gives the next owner
 nothing. A code deploys what postiz-app's `main` holds and applies what this
 repository's trusted commit holds, nothing else, whoever types it.
 
+**More than one repository.** The gate can serve other repositories of the same
+owner: `deploy_gate_repositories` in `bootstrap/variables.tf` names them, and
+`bootstrap/local.auto.tfvars` is read by Terraform and ignored by git, for names
+that should not be public. Each one has its own trusted commit: `cd` into a
+clone of it and run this repository's `scripts/deploy-gate.sh trust` from
+there. Its jobs call a copy of `scripts/gate-ci.sh`, the GitHub environment of
+a job says which role it gets, and those roles trust the gate's role and
+nothing else, like the two here. People and authenticators are the same
+everywhere: whoever may deploy here may deploy there, and a code is spent once
+for all of them.
+
 What the gate does not do:
 
 - It does not read the change for you. `trust` approves a commit of this

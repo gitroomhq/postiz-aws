@@ -8,6 +8,8 @@
 #   - the run's GitHub token says: this repository, a manual run on main, at the
 #     trusted commit (scripts/deploy-gate.sh trust, run with admin credentials
 #     after reading what changed), in the GitHub environment of the role
+#   - or the same for another repository of the same owner that
+#     var.deploy_gate_repositories names, with its own trusted commit and roles
 #   - the person who started the run was given an authenticator and that
 #     environment (scripts/deploy-gate.sh enroll <github user>); the gate knows
 #     them by GitHub's numeric user id
@@ -39,19 +41,46 @@ locals {
   # out and admins included.
   gate_secret_prefix = "postiz/deploy-gate/totp/"
 
-  # GitHub environment of the job -> the role its credentials are for, and how
-  # long one code keeps that run going. Credentials last an hour whatever this
-  # says (a role assumed from a role); terraform asks again when they expire.
+  # GitHub environment of the job -> the role its credentials are for, what the
+  # person who started the run must be allowed (scripts/deploy-gate.sh enroll and
+  # grant give "deploy", and "production" for terraform apply), and how long one
+  # code keeps that run going. Credentials last an hour whatever this says (a
+  # role assumed from a role); terraform asks again when they expire.
   gate_targets = {
     deploy = {
       role_arn         = "arn:aws:iam::${var.aws_account_id}:role/${var.deploy_role_name}"
+      right            = "deploy"
       approval_seconds = 5400 # builds (up to an hour) must be done before the release job starts
     }
     production = {
       role_arn         = aws_iam_role.apply.arn
+      right            = "production"
       approval_seconds = 7200
     }
   }
+
+  # GitHub repository id -> its name and targets: this repository, and the ones
+  # var.deploy_gate_repositories adds. Each has its own trusted commit.
+  gate_repositories = merge(
+    {
+      for id, repository in var.deploy_gate_repositories : id => {
+        name = repository.name
+        targets = {
+          for environment, target in repository.targets : environment => {
+            role_arn         = "arn:aws:iam::${var.aws_account_id}:role/${target.role_name}"
+            right            = target.right
+            approval_seconds = target.approval_seconds
+          }
+        }
+      }
+    },
+    {
+      (var.github_repository_id) = {
+        name    = var.github_repository
+        targets = local.gate_targets
+      }
+    },
+  )
 }
 
 # --- state: the trusted commit, used codes, approved runs ---------------------
@@ -108,9 +137,11 @@ resource "aws_iam_role" "deploy_gate" {
 
 data "aws_iam_policy_document" "deploy_gate" {
   statement {
-    sid       = "HandOutTheGatedRoles"
-    actions   = ["sts:AssumeRole"]
-    resources = [for target in values(local.gate_targets) : target.role_arn]
+    sid     = "HandOutTheGatedRoles"
+    actions = ["sts:AssumeRole"]
+    resources = distinct(flatten([
+      for repository in values(local.gate_repositories) : [for target in values(repository.targets) : target.role_arn]
+    ]))
   }
 
   statement {
@@ -162,11 +193,10 @@ resource "aws_lambda_function" "deploy_gate" {
       TABLE               = aws_dynamodb_table.deploy_gate.name
       SECRET_PREFIX       = local.gate_secret_prefix
       AUDIENCE            = var.deploy_gate_audience
-      REPOSITORY_ID       = var.github_repository_id
       REPOSITORY_OWNER_ID = var.github_repository_owner_id
       REF                 = "refs/heads/main"
       MAX_FAILURES        = "5"
-      TARGETS             = jsonencode(local.gate_targets)
+      REPOSITORIES        = jsonencode(local.gate_repositories)
     }
   }
 
@@ -215,10 +245,12 @@ resource "aws_apigatewayv2_stage" "deploy_gate" {
   name        = "$default"
   auto_deploy = true
 
-  # a deploy makes a handful of requests
+  # A deploy makes a handful of requests; a terraform run over many roots at
+  # once asks for credentials from every job, a few times each. Guessing codes
+  # is stopped by the lock per person, not here.
   default_route_settings {
-    throttling_burst_limit = 20
-    throttling_rate_limit  = 5
+    throttling_burst_limit = 60
+    throttling_rate_limit  = 20
   }
 }
 

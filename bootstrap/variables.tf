@@ -68,3 +68,43 @@ variable "deploy_gate_audience" {
   type        = string
   default     = "postiz-deploy-gate"
 }
+
+variable "deploy_gate_repositories" {
+  description = <<-EOT
+    More repositories of the same owner whose workflows get their roles from the
+    deploy gate, by numeric repository id (gh api repos/OWNER/NAME --jq .id).
+    For each one its owner/name and, per GitHub environment of its jobs: the name
+    of the role in this account the gate hands out (the role must trust the
+    gate's role, see README "Deploy gate"), what the person who starts the run
+    must be allowed, "deploy" or "production" (terraform apply), and how long
+    one code keeps a run going. Each repository has its own trusted commit.
+    For repositories that should not be named here, bootstrap/local.auto.tfvars
+    is read by Terraform and ignored by git.
+  EOT
+  type = map(object({
+    name = string
+    targets = map(object({
+      role_name        = string
+      right            = string
+      approval_seconds = optional(number, 5400)
+    }))
+  }))
+  default = {}
+
+  validation {
+    condition     = alltrue([for id in keys(var.deploy_gate_repositories) : can(regex("^[0-9]+$", id))])
+    error_message = "The keys are numeric repository ids."
+  }
+
+  validation {
+    condition = alltrue(flatten([
+      for repository in values(var.deploy_gate_repositories) : [for target in values(repository.targets) : contains(["deploy", "production"], target.right)]
+    ]))
+    error_message = "right is \"deploy\" or \"production\"."
+  }
+
+  validation {
+    condition     = !contains(keys(var.deploy_gate_repositories), var.github_repository_id)
+    error_message = "This repository is served already: name only the others."
+  }
+}

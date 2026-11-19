@@ -1,0 +1,38 @@
+name: deploy gate tests
+
+# The deploy gate (bootstrap/deploy-gate.tf) is applied by hand and never by CI,
+# so a pull request cannot change the gate that runs. This checks a change to it
+# before someone applies it: the function's unit tests and the stack's offline
+# plan test. No AWS credentials, nothing is planned against the account.
+
+on:
+  pull_request:
+    paths:
+      - "bootstrap/**"
+      - "scripts/deploy-gate.sh"
+      - "scripts/gate-ci.sh"
+      - ".github/workflows/gate-tests.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: the function
+        run: python3 -m unittest discover -s bootstrap/deploy-gate
+      - name: the scripts
+        run: bash -n scripts/deploy-gate.sh && bash -n scripts/gate-ci.sh
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.17.0"
+          terraform_wrapper: false
+      - name: the stack
+        run: |
+          terraform fmt -check -recursive bootstrap
+          terraform -chdir=bootstrap init -backend=false -input=false
+          terraform -chdir=bootstrap validate -no-color
+          terraform -chdir=bootstrap test -no-color
