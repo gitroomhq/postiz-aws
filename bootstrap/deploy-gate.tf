@@ -245,10 +245,12 @@ resource "aws_apigatewayv2_stage" "deploy_gate" {
   name        = "$default"
   auto_deploy = true
 
-  # a deploy makes a handful of requests
+  # A deploy makes a handful of requests; a terraform run over many roots at
+  # once asks for credentials from every job, a few times each. Guessing codes
+  # is stopped by the lock per person, not here.
   default_route_settings {
-    throttling_burst_limit = 20
-    throttling_rate_limit  = 5
+    throttling_burst_limit = 60
+    throttling_rate_limit  = 20
   }
 }
 
