@@ -111,7 +111,7 @@ Fixed infrastructure at us-east-2 on-demand list prices (October 2026):
 | Public IPv4, cross-AZ, Cloud Map (estimate) | $45 | $45 |
 | CloudWatch, Secrets Manager, ECR, logs bucket (estimate) | $70 | $70 |
 | AWS WAF: web ACL and 5 rules (plus $0.60 per million requests) | $10+ | $10+ |
-| Security alerts: GuardDuty (hosts, databases, API calls; plus $1 per GB of DNS logs), audit trail copy, alarms (estimate) | $45+ | $45+ |
+| Security alerts: GuardDuty (hosts, Fargate tasks, databases, API calls; plus $1 per GB of DNS logs), audit trail copy, alarms (estimate) | $50+ | $50+ |
 
 On top of that comes internet egress, $0.09/GB for the first 10 TB a month
 (the first 100 GB are free), and usually the largest line for Postiz: media
@@ -480,8 +480,10 @@ Secrets Manager, then restart the services.
 
 What it does not see: a break-in through Postiz itself (a stolen admin login,
 an API used within its limits), and what was typed in a shell. GuardDuty's
-agent runs on the EC2 hosts only, not in the internal apps' Fargate tasks
-(`guardduty_runtime_monitoring = false` takes it off). The first 30 days of
+agent runs on the EC2 hosts, and as a sidecar container in the Fargate tasks of
+the internal apps, where a service gets it with its next deployment
+(`guardduty_runtime_monitoring = false` takes it off everywhere,
+`guardduty_fargate_monitoring = false` off the Fargate tasks). The first 30 days of
 GuardDuty are free, and its console's Usage page shows what each part will
 cost. This repository is public, so anyone can read which calls alert.
 

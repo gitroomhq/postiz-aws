@@ -175,16 +175,19 @@ module "guardduty" {
     # target "GuardDuty") to every route table of the VPC. Those routes are
     # GuardDuty's, not Terraform's, and cannot be deleted; there is no VPC
     # endpoint. A host tagged GuardDutyManaged=false is left alone.
-    # Not the Fargate tasks of the internal apps (ECS_FARGATE_AGENT_MANAGEMENT):
-    # there the agent is a sidecar in every task, inside the task's own CPU and
-    # memory, and each service needs a new deployment to get it. So GuardDuty's
-    # Runtime coverage page shows the cluster as unhealthy, with every host
-    # covered and those services listed as "agent not provisioned".
+    # ECS_FARGATE_AGENT_MANAGEMENT: the Fargate tasks of the cluster, which are
+    # the internal apps (postiz-internal-infra). GuardDuty attaches the agent as a
+    # sidecar container when a task starts. It is not in the task definition, it
+    # shows in the task as aws-guardduty-agent-*, it takes at most 128 MiB out of
+    # the task's own memory, and a task whose sidecar cannot start runs without
+    # it. A service gets it with its next deployment and not before: a running
+    # task is never changed. Until every service has had one, GuardDuty's Runtime
+    # coverage page lists the cluster as unhealthy and names the services left.
     RUNTIME_MONITORING = {
       status = local.guardduty_runtime
       additional = {
         EC2_AGENT_MANAGEMENT         = local.guardduty_runtime
-        ECS_FARGATE_AGENT_MANAGEMENT = "DISABLED"
+        ECS_FARGATE_AGENT_MANAGEMENT = var.guardduty_runtime_monitoring && var.guardduty_fargate_monitoring ? "ENABLED" : "DISABLED"
         EKS_ADDON_MANAGEMENT         = "DISABLED"
       }
     }

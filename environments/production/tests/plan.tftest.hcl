@@ -596,6 +596,15 @@ run "security_alerts" {
   }
 
   assert {
+    condition = module.guardduty.additional["RUNTIME_MONITORING"] == {
+      EC2_AGENT_MANAGEMENT         = "ENABLED"
+      ECS_FARGATE_AGENT_MANAGEMENT = "ENABLED"
+      EKS_ADDON_MANAGEMENT         = "DISABLED"
+    }
+    error_message = "GuardDuty's agent goes on the EC2 hosts and into the Fargate tasks"
+  }
+
+  assert {
     condition     = keys(aws_cloudwatch_event_rule.api_alert) == ["database-change", "detection-changed", "network-opened", "shell-session"] && keys(aws_cloudwatch_metric_alarm.trail_alert) == ["iam-role-change", "iam-user-or-key", "other-region", "root-used"]
     error_message = "four alerts on calls in this Region, four on IAM and the other Regions"
   }
@@ -649,7 +658,24 @@ run "security_runtime_monitoring_off" {
   }
 
   assert {
-    condition     = module.guardduty.features["RUNTIME_MONITORING"] == "DISABLED"
-    error_message = "guardduty_runtime_monitoring = false takes the agent off the detector"
+    condition     = module.guardduty.features["RUNTIME_MONITORING"] == "DISABLED" && alltrue([for status in values(module.guardduty.additional["RUNTIME_MONITORING"]) : status == "DISABLED"])
+    error_message = "guardduty_runtime_monitoring = false takes the agent off the detector, the Fargate tasks included"
+  }
+}
+
+run "security_fargate_monitoring_off" {
+  command = plan
+
+  variables {
+    guardduty_fargate_monitoring = false
+  }
+
+  assert {
+    condition = module.guardduty.additional["RUNTIME_MONITORING"] == {
+      EC2_AGENT_MANAGEMENT         = "ENABLED"
+      ECS_FARGATE_AGENT_MANAGEMENT = "DISABLED"
+      EKS_ADDON_MANAGEMENT         = "DISABLED"
+    }
+    error_message = "guardduty_fargate_monitoring = false keeps the agent on the hosts and out of the Fargate tasks"
   }
 }
