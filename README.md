@@ -49,7 +49,7 @@ Cloudflare R2 (media) and RunPod (media processing) stay where they are.
 | Temporal UI + Basic Auth | temporalio/ui 2.39.0 + Caddy basic auth with the same user and password, on a random unlisted hostname like Railway's generated URL |
 | Railway variables | Secrets Manager, one JSON secret per service |
 | Resend (email) | Amazon SES in us-east-2 as postiz.com, sent with each service's task role ([ses.tf](environments/production/ses.tf)); `ses_sending_enabled` switches backend, mcp and the workers over |
-| Railway auto-deploy + pre-deploy `prisma db push` | Push to postiz-app main -> `deploy-postiz` workflow: build, db push task, roll services |
+| Railway auto-deploy + pre-deploy `prisma db push` | `deploy-postiz` workflow, started by hand with a code from an authenticator: build, db push task, roll services |
 
 ### Decisions worth knowing
 
@@ -135,12 +135,11 @@ the environment:
 | GitHub secret | `CLOUDFLARE_API_TOKEN` | Zone > Zone > Read and Zone > DNS > Edit, both on the zone only |
 | GitHub secret | `APP_REPO_TOKEN` | optional, only if the app repo is private |
 | GitHub variable | `TF_STATE_BUCKET` | state bucket, output of `bootstrap/` |
-| GitHub variable | `AWS_PLAN_ROLE_ARN`, `AWS_APPLY_ROLE_ARN` | outputs of `bootstrap/` |
-| GitHub variable | `AWS_DEPLOY_ROLE_ARN` | output of `environments/production` |
-| GitHub variable | `AUTO_DEPLOY` | `true` once AWS serves production |
+| GitHub variable | `AWS_PLAN_ROLE_ARN` | output of `bootstrap/` |
+| GitHub variable | `DEPLOY_GATE_URL` | output `deploy_gate_url` of `bootstrap/`: where the workflows ask the [deploy gate](#deploy-gate) for credentials |
 | GitHub variable | `BUILD_RUNNER`, `APP_REPOSITORY` | optional: arm64 runner label, app repo (default `gitroomhq/postiz-app`) |
-| GitHub environment | `production` | terraform apply: main branch only, no reviewers, so every push to main applies (add required reviewers to approve each apply) |
-| GitHub environment | `deploy` | deploy-postiz and ops-image: main branch only, no reviewers |
+| GitHub environment | `production` | terraform apply: main branch only. The deploy gate gives the admin role only to jobs in it |
+| GitHub environment | `deploy` | deploy-postiz and ops-image: main branch only. The deploy gate gives the deploy role only to jobs in it |
 | Local shell | `TF_VAR_aws_account_id`, `TF_VAR_alert_emails`, `TF_VAR_temporal_ui_domain`, `AWS_PROFILE`, `CLOUDFLARE_API_TOKEN` | same values for local runs (an apply without `TF_VAR_alert_emails` removes the alert subscriptions) |
 | Local file | `environments/production/backend.hcl` | from `backend.hcl.example` (git-ignored) |
 
@@ -151,16 +150,87 @@ terraform -chdir=environments/production init -backend-config=backend.hcl
 
 ### Running this as a public repository
 
-- Pull requests from forks never get AWS credentials: GitHub gives no OIDC token to fork PRs, and the roles trust only this repository's pull requests and `main` (plan, read-only), the `production` environment (apply) and the `deploy` environment (deploys).
-- Turn on *Settings > Actions > Require approval for all outside collaborators*, and restrict both environments to the `main` branch. Every push to `main` applies with the admin role, so write access to this repository means admin on the AWS account: keep it to the people who run production, or add required reviewers to `production`.
+- Pull requests from forks never get AWS credentials: GitHub gives no OIDC token to fork PRs, and the only role that trusts GitHub is the read-only plan role, for this repository's pull requests and `main`.
+- Write access to this repository is not access to production. The roles that change anything are handed out by the [deploy gate](#deploy-gate), only to a run of a commit someone approved from their own machine, started with a code from an authenticator. What write access does give is the plan role: any branch can change the workflow a pull request runs, so whoever can push can read what `ReadOnlyAccess` reads and the Terraform state (no secret values). Keep write access to the people who run production.
+- Turn on *Settings > Actions > Require approval for all outside collaborators*, and restrict both environments to the `main` branch.
 - Actions logs of a public repository are public. They contain plans and deploy output (resource IDs, private hostnames), never secret values. The account id is a secret, so the logs print `***` for it, also inside ARNs and the ECR registry name; the alert emails are a secret and a sensitive Terraform variable. PR comments carry only the plan's summary line.
-- Automatic deploys only ship commits on the app's `main`: **deploy-postiz** checks a dispatched commit against the app repository before it builds anything, so a leaked dispatch token cannot deploy a branch or a fork's pull request.
+- Deploys only ship commits on the app's `main`: **deploy-postiz** checks the commit against the app repository before it builds anything, so a deploy cannot be pointed at a branch or at a fork's pull request, which anyone can open.
 - The Temporal UI is public like on Railway, behind basic auth, on an unlisted hostname: a random name kept in the `TEMPORAL_UI_DOMAIN` secret and covered by a wildcard certificate, so it shows up neither in this repository, nor in the logs, nor in certificate transparency logs. `temporal_ui_allowed_cidrs` can limit it to a few IP ranges. Forks can keep the variable's default, `temporal_ui_public = false`: no public hostname at all, `scripts/temporal-ui-tunnel.sh` opens it through Session Manager.
+
+## Deploy gate
+
+Nothing in GitHub can change production on its own. The two roles that can, the
+admin role of `terraform apply` and the deploy role, do not trust GitHub. They
+trust one Lambda function, the deploy gate (`bootstrap/deploy-gate.tf`), and it
+gives a workflow run one hour of credentials only when both of these hold:
+
+- **A code.** The run was started by hand with a 6-digit code from an
+  authenticator app (the workflow's `otp` input). A code works once, for about a
+  minute, and five wrong ones lock the gate.
+- **A trusted commit.** The run is on `main` of this repository, at the commit
+  you last approved from your own machine with `scripts/deploy-gate.sh trust`.
+
+So a stolen GitHub account or token gets no credentials. A changed workflow,
+script or Terraform file is a new commit, which the gate refuses until someone
+with admin credentials for the account has trusted it; the trusted workflows do
+nothing without a code; and deleting the check from a workflow removes nothing,
+because the check is in AWS. `bootstrap/` is applied by hand and never by CI, so
+a pull request cannot change the gate either.
+
+| When | What you do |
+|---|---|
+| Every deploy, every `terraform apply`, every ops image build | Run the workflow by hand and type the code. Each run needs a new one |
+| After every new commit on this repository's `main` | `scripts/deploy-gate.sh trust`: it lists the commits and files changed since the trusted commit and asks before it moves. Read the change first: this is the review the gate relies on |
+| A run was refused | The job log says why: a wrong, used or expired code, a commit that is not trusted, or a re-run (a re-run is a new attempt with the old code, so start a new run). A run that waits behind another deploy starts with an expired code: start it when the other one is done |
+| The gate is locked | `scripts/deploy-gate.sh reset`, after looking at who sent the wrong codes: `aws logs tail /aws/lambda/postiz-deploy-gate --since 1d` |
+| New phone, lost phone | `scripts/deploy-gate.sh enroll --rotate` |
+| What is trusted, who is approved | `scripts/deploy-gate.sh status` |
+
+`scripts/deploy-gate.sh` needs admin credentials for the account
+(`export AWS_PROFILE=<profile>`), which is the point: trusting a commit,
+unlocking and enrolling cannot be done from GitHub.
+
+What the gate does not do:
+
+- It does not read the change for you. `trust` approves a commit of this
+  repository, and a code deploys whatever postiz-app's `main` holds.
+- It does not cover the read-only plan role, which pull requests use.
+- It does not stand between the account's admins and the account.
+
+**How it works.** A job asks GitHub for a token that says which repository,
+branch, commit, run, attempt and environment it is, and sends it to the gate's
+address (`scripts/gate-ci.sh`). API Gateway verifies GitHub's signature on the
+token and the function decides on what it says (`bootstrap/deploy-gate/handler.py`):
+the first job of a run sends the code and gets that run attempt approved, for 90
+minutes in the `deploy` environment and two hours in `production`; every later
+job gets credentials for the role of its environment while the approval lasts.
+The function logs every decision, never a code or a credential. The
+authenticator secret is created by `enroll` on your machine and stored where only
+the function can read it; it is in no Terraform state.
+
+**Setting it up** (once, in this order, so that nothing is locked out):
+
+1. `terraform -chdir=bootstrap init && terraform -chdir=bootstrap apply` creates
+   the gate. From this moment GitHub can no longer assume the apply role.
+2. `scripts/deploy-gate.sh enroll`, in your own terminal: it shows the secret
+   once, as a QR code when `qrencode` is installed, and checks a code from your
+   phone before it stores anything.
+3. Set the repository variable `DEPLOY_GATE_URL` to
+   `terraform -chdir=bootstrap output -raw deploy_gate_url`.
+4. With the workflows of this version on `main`: `scripts/deploy-gate.sh trust`.
+5. Run the **terraform** workflow with a code. It applies
+   `environments/production`, which takes the deploy role away from GitHub too.
+   Until this apply, deploys fail: the gate cannot hand out a role that does not
+   trust it yet.
+
+If the gate itself is broken, admin credentials still work: apply locally
+(`terraform -chdir=environments/production apply`), and fix the gate with
+`terraform -chdir=bootstrap apply`.
 
 ## Layout
 
 ```
-bootstrap/                 state bucket, GitHub OIDC, plan/apply/read-only roles (applied once, by hand)
+bootstrap/                 state bucket, GitHub OIDC, plan/apply/read-only roles, the deploy gate (applied by hand, never by CI)
 modules/
   network/                 VPC, public + private subnets, no NAT
   ecs-cluster/             ECS cluster, Graviton ASG, capacity provider
@@ -169,19 +239,21 @@ modules/
 environments/production/   everything else; app-env-keys.json = env var names per service
   tests/                   offline plan test with mocked providers
 docker/                    postiz-app.Dockerfile (one image per app), postiz.Dockerfile (all-in-one, before the split), ops.Dockerfile (migration toolbox)
-scripts/                   migration, env copy, Temporal UI tunnel and CLI, read-only psql, test browser, ECR retag
+scripts/                   migration, env copy, Temporal UI tunnel and CLI, read-only psql, test browser, ECR retag, deploy gate (deploy-gate.sh for you, gate-ci.sh for the workflows)
 .claude/skills/temporal/   Claude Code skill: production Temporal through scripts/temporal-cli.sh
-.github/workflows/         terraform (plan on PR, apply on main), deploy-postiz, ops-image
+.github/workflows/         terraform (plan on PR, apply by hand), deploy-postiz, ops-image: all three change production only through the deploy gate
 docs/migration-runbook.md
 ```
 
 ## Day to day
 
 **Infrastructure changes:** open a PR to see the plan first: CI runs fmt,
-validate, the offline test and a plan (summary commented on the PR). Every push
-to `main` that touches `environments/` or `modules/` applies right away, merges
-included, and a local apply that never reaches `main` is undone by the next
-push. PR plans run with `-refresh=false`, because the
+validate, the offline test and a plan (summary commented on the PR). Nothing
+applies on a merge. To apply what `main` holds: `scripts/deploy-gate.sh trust`
+(once per new commit on `main`, it shows what changed), then Actions >
+**terraform** > Run workflow with a code from the authenticator, see
+[Deploy gate](#deploy-gate). A local apply that never reaches `main` is undone
+by the next apply. PR plans run with `-refresh=false`, because the
 plan role cannot read any secret value. Do the same when planning with the
 read-only profile.
 
@@ -208,20 +280,13 @@ The KMS key and the data key secret must never be deleted (every channel would
 have to be connected again), and after step 3 a postiz-app from before the
 encryption must never be deployed. To step back, use `read-only`, not `off`.
 
-**Deploy Postiz:** pushing to postiz-app `main` deploys it, like on Railway.
-postiz-app's `.github/workflows/deploy-aws.yml` sends a `repository_dispatch` to
-this repo's **deploy-postiz** workflow. It skips commits that only touch docs,
-the extension, the SDK or CI. Each automatic run is named after the commit that
-started it (title, author, short sha), and the run's summary links the commit,
-its author and its pull request. One-time setup:
-
-1. Create a fine-grained token with *Contents: read and write* on this repository only.
-2. Save it in postiz-app as the secret `POSTIZ_AWS_DISPATCH_TOKEN`.
-3. Set the variable `AUTO_DEPLOY = true` in this repo at the cutover. Until then dispatches are ignored, because `prisma db push` must not touch the empty database before the restore.
-
-postiz-app's trigger skips commits that change no file outside the ignored paths,
-so an empty commit (`git commit --allow-empty`) never deploys: test with a real
-one-line change.
+**Deploy Postiz:** Actions > **deploy-postiz** > Run workflow: type the code from
+the authenticator and, to deploy something other than the head of postiz-app's
+`main`, an earlier commit of it. Nothing deploys on a push, and every deploy
+needs its own code, see [Deploy gate](#deploy-gate). A run that changes nothing
+an app is built from (docs, the extension, the SDK, CI) builds and restarts
+nothing. The run's summary links the commit that is deploying, its author and
+its pull request.
 
 **One slim image per app, built only when the app changed**
 (`docker/postiz-app.Dockerfile`; postiz-app's own all-in-one image stays the
@@ -244,15 +309,14 @@ each, and reuses an image already pushed for the commit. **release** runs
 (the commit on `migrate-production`, which only a successful push moves), moves
 `<app>-production` and restarts only those
 services. Anything unclear (no live image, a rollback, rewritten history, a huge
-diff) builds and restarts that app; every manual run does all of them. The run's
-summary shows the plan and why.
+diff) builds and restarts that app, and a run with `all` checked does all of
+them. The run's summary shows the plan and why.
 
-You can also run **deploy-postiz** by hand with any ref. It builds `linux/arm64`
+A deploy builds `linux/arm64`
 and runs the db push as a one-off task (Railway's pre-deploy command), and only
 moves the release tags and rolls the services if that succeeds. A failed rollout
 is rolled back by the ECS circuit breaker; after a failed db push the next deploy
-pushes again. Pushes that land while a deploy runs
-collapse into one deploy of the newest commit. To roll back a release, run
+pushes again. Deploys run one at a time. To roll back a release, run
 **deploy-postiz** with the previous commit and `skip_db_push` checked. Its images
 are reused when they exist, and `prisma db push` would refuse to drop columns the
 newer release added.
@@ -440,7 +504,7 @@ Identity Center user and add them to the read-only group.
 
 The modules are generic; `environments/production` is Postiz's own setup.
 
-1. Fork, change `github_repository`, `github_oidc_subject` (printed by `gh api repos/<owner>/<name>/actions/oidc/customization/sub --jq .sub_claim_prefix`), the domains, sizes and region in `environments/production/terraform.tfvars`, and set the secrets, variables and environments above (`bootstrap/` takes the same two from `TF_VAR_github_repository` and `TF_VAR_github_oidc_subject`).
+1. Fork, change `github_repository`, the domains, sizes and region in `environments/production/terraform.tfvars`, and set the secrets, variables and environments above. `bootstrap/` takes your repository from `TF_VAR_github_repository`, `TF_VAR_github_oidc_subject` (printed by `gh api repos/<owner>/<name>/actions/oidc/customization/sub --jq .sub_claim_prefix`), and for the deploy gate `TF_VAR_github_repository_id` and `TF_VAR_github_repository_owner_id` (`gh api repos/<owner>/<name> --jq '.id, .owner.id'`).
 2. Follow phase A of the runbook. The Railway-specific steps (copying env vars and data) are optional. For a new installation, fill the Secrets Manager secrets by hand, then in the ops task (runbook B1) run `migrate-postgres.sh init`: it creates the app roles with the passwords of the backend, mcp and worker `DATABASE_URL`s, and the `temporal` database. The first **deploy-postiz** run creates the tables, and Temporal sets up its own schema on start.
 3. Your organization may allow different regions; ACM certificates for CloudFront always live in us-east-1.
 

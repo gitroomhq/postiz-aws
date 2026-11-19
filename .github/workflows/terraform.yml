@@ -1,8 +1,12 @@
 name: terraform
 
 # Pull requests: fmt, validate and plan with the read-only role, plan posted as a comment.
-# main: plan + apply with the admin role, in the "production" environment. It has no
-# required reviewers, so every push applies; add them to approve each apply first.
+# Apply: started by hand on main with a code from the authenticator, nothing
+# applies on a push. The admin role is handed out only by the deploy gate (README
+# "Deploy gate"): the first job shows it the code, the apply job asks it for
+# credentials (scripts/gate-ci.sh). The gate answers only a manual run on main, at
+# the commit scripts/deploy-gate.sh trust recorded, in the "production" GitHub
+# environment. A re-run is a new attempt and gets nothing: start a new run.
 
 on:
   pull_request:
@@ -10,13 +14,11 @@ on:
       - "environments/**"
       - "modules/**"
       - ".github/workflows/terraform.yml"
-  push:
-    branches: [main]
-    paths:
-      - "environments/**"
-      - "modules/**"
-      - ".github/workflows/terraform.yml"
   workflow_dispatch:
+    inputs:
+      otp:
+        description: 6-digit code from the authenticator
+        required: true
 
 permissions:
   contents: read
@@ -28,7 +30,7 @@ concurrency:
   cancel-in-progress: false
 
 # Account-specific values live in the repository settings, not in this public repo:
-#   variables TF_STATE_BUCKET, AWS_PLAN_ROLE_ARN, AWS_APPLY_ROLE_ARN;
+#   variables TF_STATE_BUCKET, AWS_PLAN_ROLE_ARN, DEPLOY_GATE_URL;
 #   secrets CLOUDFLARE_API_TOKEN, AWS_ACCOUNT_ID, ALERT_EMAILS (HCL list, optional),
 #   TEMPORAL_UI_DOMAIN.
 # The account id and the Temporal UI's hostname are secrets so the public logs
@@ -46,6 +48,7 @@ env:
   TF_VAR_temporal_ui_google_client_id: ${{ secrets.TEMPORAL_UI_GOOGLE_CLIENT_ID }}
   TF_VAR_temporal_ui_google_client_secret: ${{ secrets.TEMPORAL_UI_GOOGLE_CLIENT_SECRET }}
   TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+  DEPLOY_GATE_URL: ${{ vars.DEPLOY_GATE_URL }}
 
 jobs:
   plan:
@@ -97,10 +100,24 @@ jobs:
             const run = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
             await github.rest.issues.createComment({ ...context.repo, issue_number: context.issue.number, body: `### terraform plan: ${summary}\n\n[Full plan in the job log](${run})` });
 
-  apply:
-    if: github.event_name != 'pull_request'
+  # First and fast: a code is good for about a minute.
+  authorize:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     environment: production
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: show the code to the deploy gate
+        run: scripts/gate-ci.sh open
+
+  apply:
+    needs: authorize
+    runs-on: ubuntu-latest
+    environment: production
+    # the approval lasts two hours and the last credentials one more
+    timeout-minutes: 170
     steps:
       - uses: actions/checkout@v4
 
@@ -109,11 +126,10 @@ jobs:
           terraform_version: ${{ env.TF_VERSION }}
           terraform_wrapper: false
 
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ vars.AWS_APPLY_ROLE_ARN }}
-          role-duration-seconds: 7200
-          aws-region: ${{ env.AWS_REGION }}
+      # An AWS profile that asks the gate again when the hour is over, so a long
+      # apply never loses its credentials before it has written its state.
+      - name: aws credentials from the deploy gate
+        run: scripts/gate-ci.sh login refresh
 
       - name: init
         run: terraform -chdir=$WORKDIR init -input=false -backend-config="bucket=$TF_STATE_BUCKET"

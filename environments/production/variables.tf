@@ -22,20 +22,13 @@ variable "github_repository" {
   type        = string
 }
 
-variable "github_oidc_subject" {
+variable "deploy_gate_role_name" {
   description = <<-EOT
-    Trusted by the deploy role, as in bootstrap/: start of the sub claim in this
-    repository's GitHub OIDC tokens, printed by
-    gh api repos/OWNER/NAME/actions/oidc/customization/sub --jq .sub_claim_prefix
-    Repositories created since July 2026 carry the owner and repository ids
-    (repo:owner@id/name@id), older ones repo:owner/name.
+    Role of the deploy gate's Lambda function (bootstrap/deploy-gate.tf), the only
+    principal the deploy role trusts. bootstrap/ must be applied first.
   EOT
   type        = string
-
-  validation {
-    condition     = can(regex("^repo:[^:]+$", var.github_oidc_subject))
-    error_message = "Only the prefix, for example repo:owner@123/name@456 (no :ref: or :environment: part)."
-  }
+  default     = "postiz-deploy-gate"
 }
 
 variable "vpc_cidr" {

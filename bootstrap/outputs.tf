@@ -12,7 +12,7 @@ output "plan_role_arn" {
 }
 
 output "apply_role_arn" {
-  description = "GitHub variable AWS_APPLY_ROLE_ARN"
+  description = "Handed out by the deploy gate to approved runs in the production environment"
   value       = aws_iam_role.apply.arn
 }
 
@@ -24,4 +24,14 @@ output "agent_readonly_role_arn" {
 output "team_readonly_role_arn" {
   description = "Role to grant team members in account access manager (create-entitlement)"
   value       = aws_iam_role.team_readonly.arn
+}
+
+output "deploy_gate_url" {
+  description = "GitHub variable DEPLOY_GATE_URL"
+  value       = aws_apigatewayv2_api.deploy_gate.api_endpoint
+}
+
+output "deploy_gate_table" {
+  description = "The gate's state: trusted commit, used codes, approved runs (scripts/deploy-gate.sh)"
+  value       = aws_dynamodb_table.deploy_gate.name
 }

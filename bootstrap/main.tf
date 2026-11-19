@@ -8,7 +8,10 @@
 #   - postiz-github-terraform-plan   read-only, used by pull requests (plans run with
 #                                    -refresh=false, so it never needs a secret value; any
 #                                    branch can change the workflow, so it must stay weak)
-#   - postiz-github-terraform-apply  admin, only from the "production" GitHub environment
+#   - postiz-github-terraform-apply  admin, handed out only by the deploy gate
+#   - the deploy gate (deploy-gate.tf): a code from an authenticator app and a
+#                                    trusted commit before any run gets a role that
+#                                    changes production
 #   - postiz-agent-readonly          for AI agents and humans poking around, cannot read secret values
 #   - postiz-team-readonly           for team members signing in through IAM Identity Center
 #                                    (account access manager), cannot read secret values
@@ -20,6 +23,10 @@ terraform {
     aws = {
       source  = "hashicorp/aws"
       version = ">= 6.70, < 7.0"
+    }
+    archive = {
+      source  = "hashicorp/archive"
+      version = ">= 2.7, < 3.0"
     }
   }
 
@@ -220,37 +227,38 @@ resource "aws_iam_role_policy" "plan_extra" {
   policy = data.aws_iam_policy_document.plan_extra.json
 }
 
-# --- apply role: only jobs running in the protected "production" environment ---
+# --- apply role: only through the deploy gate ---------------------------------
+# GitHub cannot assume it. The gate (deploy-gate.tf) assumes it for a run of the
+# trusted commit in the "production" environment that was approved with a code,
+# and passes the credentials on. The account is the principal and the condition
+# names the gate's role, so the trust survives the gate's role being recreated.
 
 data "aws_iam_policy_document" "apply_trust" {
   statement {
-    actions = ["sts:AssumeRoleWithWebIdentity"]
+    actions = ["sts:AssumeRole"]
     principals {
-      type        = "Federated"
-      identifiers = [aws_iam_openid_connect_provider.github.arn]
+      type        = "AWS"
+      identifiers = ["arn:aws:iam::${var.aws_account_id}:root"]
     }
     condition {
-      test     = "StringEquals"
-      variable = "token.actions.githubusercontent.com:aud"
-      values   = ["sts.amazonaws.com"]
-    }
-    condition {
-      test     = "StringEquals"
-      variable = "token.actions.githubusercontent.com:sub"
-      values   = ["${local.github_sub}:environment:production"]
+      test     = "ArnEquals"
+      variable = "aws:PrincipalArn"
+      values   = [aws_iam_role.deploy_gate.arn]
     }
   }
 }
 
 resource "aws_iam_role" "apply" {
-  name                 = "postiz-github-terraform-apply"
-  description          = "GitHub Actions terraform apply for ${var.github_repository}, production environment only"
-  assume_role_policy   = data.aws_iam_policy_document.apply_trust.json
-  max_session_duration = 7200 # a first apply (RDS Multi-AZ, CloudFront) can pass an hour
+  name               = "postiz-github-terraform-apply"
+  description        = "GitHub Actions terraform apply for ${var.github_repository}, handed out only by the deploy gate"
+  assume_role_policy = data.aws_iam_policy_document.apply_trust.json
+  # The gate's sessions last an hour (a role assumed from a role cannot get more);
+  # a longer apply gets new credentials from the gate while its approval lasts.
+  max_session_duration = 3600
 }
 
 # Terraform creates IAM roles, so a narrower policy would still be admin-equivalent.
-# The guard is the trust policy: only reviewed jobs in the production environment.
+# The guard is the trust policy: only the gate, for an approved run of a trusted commit.
 resource "aws_iam_role_policy_attachment" "apply_admin" {
   role       = aws_iam_role.apply.name
   policy_arn = "arn:aws:iam::aws:policy/AdministratorAccess"
