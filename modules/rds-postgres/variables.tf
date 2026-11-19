@@ -74,6 +74,22 @@ variable "parameters" {
   default = {}
 }
 
+variable "cloudwatch_logs_exports" {
+  description = <<-EOT
+    Log types copied to CloudWatch Logs ("postgresql": the server log, with the
+    connections when log_connections is on). On the instance itself a log file
+    lasts three days. RDS applies this at once, also with apply_immediately off,
+    and without a restart.
+  EOT
+  type        = list(string)
+  default     = []
+}
+
+variable "exported_log_retention_days" {
+  type    = number
+  default = 90
+}
+
 variable "secret_prefix" {
   type = string
 }

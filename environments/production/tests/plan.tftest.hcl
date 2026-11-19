@@ -76,6 +76,15 @@ mock_provider "aws" {
   }
 }
 
+# GuardDuty in the two other open Regions (security.tf)
+mock_provider "aws" {
+  alias = "eu_west_1"
+}
+
+mock_provider "aws" {
+  alias = "ap_southeast_2"
+}
+
 mock_provider "cloudflare" {
   mock_data "cloudflare_zone" {
     defaults = { id = "0123456789abcdef0123456789abcdef" }
@@ -557,4 +566,90 @@ run "waf_unknown_rule" {
   }
 
   expect_failures = [var.waf_blocking_rules]
+}
+
+run "security_alerts" {
+  command = plan
+
+  variables {
+    alert_emails = ["ops@example.com"]
+  }
+
+  assert {
+    condition     = length(aws_sns_topic_subscription.security_email) == 1 && aws_sns_topic.security.name == "postiz-production-security"
+    error_message = "the security alerts go to a topic of their own, to the same people as the alarms"
+  }
+
+  assert {
+    condition     = aws_cloudtrail.main.is_multi_region_trail && aws_cloudtrail.main.include_global_service_events && aws_cloudtrail.main.enable_log_file_validation
+    error_message = "the trail records every Region and IAM, and signs its log files"
+  }
+
+  assert {
+    condition = (
+      module.guardduty.features["RUNTIME_MONITORING"] == "ENABLED" &&
+      module.guardduty.features["RDS_LOGIN_EVENTS"] == "ENABLED" &&
+      !contains(keys(module.guardduty_eu_west_1.features), "RUNTIME_MONITORING") &&
+      !contains(keys(module.guardduty_ap_southeast_2.features), "RUNTIME_MONITORING")
+    )
+    error_message = "GuardDuty watches the hosts and the databases in the home Region, and installs nothing in the other two"
+  }
+
+  assert {
+    condition     = keys(aws_cloudwatch_event_rule.api_alert) == ["database-change", "detection-changed", "network-opened", "shell-session"] && keys(aws_cloudwatch_metric_alarm.trail_alert) == ["iam-role-change", "iam-user-or-key", "other-region", "root-used"]
+    error_message = "four alerts on calls in this Region, four on IAM and the other Regions"
+  }
+
+  # the team opens these dozens of times a day: an alert for each would bury the rest
+  assert {
+    condition = jsondecode(aws_cloudwatch_event_rule.api_alert["shell-session"].event_pattern).detail["$or"][2].requestParameters.documentName[0]["anything-but"].prefix == [
+      "postiz-team-", "AWS-StartPortForwardingSession",
+    ]
+    error_message = "the team's tunnels and the admins' port forwards open without an alert, every other session alerts"
+  }
+
+  assert {
+    condition = alltrue([
+      for key in ["database-change", "network-opened", "detection-changed"] :
+      jsondecode(aws_cloudwatch_event_rule.api_alert[key].event_pattern).detail.userIdentity.arn[0]["anything-but"].prefix == [
+        "arn:aws:sts::123456789012:assumed-role/postiz-github-terraform-apply/",
+        "arn:aws:sts::123456789012:assumed-role/postiz-internal-terraform-apply/",
+        "arn:aws:sts::123456789012:assumed-role/AWSServiceRoleFor",
+      ]
+    ])
+    error_message = "a change through the deploy gate, or by an AWS service role, raises no alert"
+  }
+
+  assert {
+    condition     = !can(jsondecode(aws_cloudwatch_event_rule.api_alert["shell-session"].event_pattern).detail.userIdentity)
+    error_message = "a shell alerts whoever opened it"
+  }
+
+  # EventBridge does not escape what it puts into a template: a double quote or a
+  # backslash in a line would make every alert of that rule undeliverable
+  assert {
+    condition = alltrue([
+      for line in concat(local.guardduty_alert_lines, flatten(values(local.api_alert_lines))) :
+      !strcontains(line, "\"") && !strcontains(line, "\\") && length(line) > 0
+    ])
+    error_message = "an alert line holds no double quote and no backslash, and is not empty"
+  }
+
+  assert {
+    condition     = alltrue([for alarm in aws_cloudwatch_metric_alarm.trail_alert : length(alarm.alarm_description) <= 1024]) && alltrue([for filter in aws_cloudwatch_log_metric_filter.trail_alert : length(filter.pattern) <= 1024])
+    error_message = "CloudWatch takes 1024 characters for an alarm's description and for a filter pattern"
+  }
+}
+
+run "security_runtime_monitoring_off" {
+  command = plan
+
+  variables {
+    guardduty_runtime_monitoring = false
+  }
+
+  assert {
+    condition     = module.guardduty.features["RUNTIME_MONITORING"] == "DISABLED"
+    error_message = "guardduty_runtime_monitoring = false takes the agent off the detector"
+  }
 }
