@@ -17,9 +17,10 @@
 # ancestor (rollback, rewritten history), or GitHub cannot list the diff (300+
 # files). A re-run of the live commit restarts the app onto the existing image.
 # libraries/** means every app: the workers import react-shared-libraries, and
-# helpers is used everywhere. Manual runs build and restart everything.
+# helpers is used everywhere. ALL=true (the workflow's "all" input) builds and
+# restarts everything and runs the db push, whatever changed.
 #
-# Environment: SHA, EVENT (github.event_name), APP_REPOSITORY, APP_TOKEN,
+# Environment: SHA, ALL, APP_REPOSITORY, APP_TOKEN,
 # REPOSITORY (ECR). Local checks: LIVE_FRONTEND / LIVE_BACKEND /
 # LIVE_ORCHESTRATOR / LIVE_MIGRATE=<sha or empty> skip ECR, CHANGED_FILES (one
 # path per line, used for every comparison) skips GitHub.
@@ -73,9 +74,9 @@ touches() { # file -> the app it touches, "all", or nothing
 apps="" services="" db_push=false why=""
 note() { why="$why"$'\n'"- $1"; }
 
-if [ -z "${CHANGED_FILES+x}" ] && [ "${EVENT:-}" != repository_dispatch ]; then
+if [ "${ALL:-}" = true ]; then
   apps="$APPS" db_push=true
-  note "manual run: every app"
+  note "every app was asked for"
 else
   : "${APP_REPOSITORY:=}" "${APP_TOKEN:=}" "${REPOSITORY:=}"
   for app in $APPS; do

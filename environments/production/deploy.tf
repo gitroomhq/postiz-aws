@@ -1,37 +1,34 @@
 # Role for .github/workflows/deploy.yml and ops-image.yml: build and push the
-# images, run prisma db push, roll the services. Only jobs in the "deploy" GitHub
-# environment can assume it: main branch only, no reviewers, so a push to the
-# app deploys on its own like on Railway (terraform apply keeps "production").
-
-data "aws_iam_openid_connect_provider" "github" {
-  url = "https://token.actions.githubusercontent.com"
-}
+# images, run prisma db push, roll the services.
+#
+# GitHub cannot assume it. Only the deploy gate can (bootstrap/deploy-gate.tf,
+# applied by hand before this stack): it assumes the role for a manual run of the
+# trusted commit in the "deploy" GitHub environment that was approved with a code
+# from the authenticator, and passes the credentials on. The account is the
+# principal and the condition names the gate's role, so the trust survives the
+# gate's role being recreated.
 
 data "aws_iam_policy_document" "deploy_trust" {
   statement {
-    actions = ["sts:AssumeRoleWithWebIdentity"]
+    actions = ["sts:AssumeRole"]
     principals {
-      type        = "Federated"
-      identifiers = [data.aws_iam_openid_connect_provider.github.arn]
+      type        = "AWS"
+      identifiers = ["arn:aws:iam::${var.aws_account_id}:root"]
     }
     condition {
-      test     = "StringEquals"
-      variable = "token.actions.githubusercontent.com:aud"
-      values   = ["sts.amazonaws.com"]
-    }
-    condition {
-      test     = "StringEquals"
-      variable = "token.actions.githubusercontent.com:sub"
-      values   = ["${var.github_oidc_subject}:environment:deploy"]
+      test     = "ArnEquals"
+      variable = "aws:PrincipalArn"
+      values   = ["arn:aws:iam::${var.aws_account_id}:role/${var.deploy_gate_role_name}"]
     }
   }
 }
 
 resource "aws_iam_role" "deploy" {
-  name                 = "${local.name}-github-deploy"
-  description          = "GitHub Actions deploys of Postiz to ${local.name}"
-  assume_role_policy   = data.aws_iam_policy_document.deploy_trust.json
-  max_session_duration = 7200
+  name               = "${local.name}-github-deploy"
+  description        = "Deploys of Postiz to ${local.name}, handed out only by the deploy gate"
+  assume_role_policy = data.aws_iam_policy_document.deploy_trust.json
+  # the gate's sessions last an hour: a role assumed from a role cannot get more
+  max_session_duration = 3600
 }
 
 locals {

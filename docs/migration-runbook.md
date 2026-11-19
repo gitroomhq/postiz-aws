@@ -79,18 +79,23 @@ is enforced by the scripts or the configuration, not left to memory:
 
 ## Phase A: build the platform (no user impact, any day before)
 
-**A1. Bootstrap** (state bucket, GitHub OIDC, CI roles):
+**A1. Bootstrap** (state bucket, GitHub OIDC, CI roles, the deploy gate):
 
 ```bash
 terraform -chdir=bootstrap init
 terraform -chdir=bootstrap apply
 ```
 
-A fork also sets `TF_VAR_github_repository` and `TF_VAR_github_oidc_subject` here
-(defaults: this repository) and the same two in
+A fork also sets `TF_VAR_github_repository`, `TF_VAR_github_oidc_subject`,
+`TF_VAR_github_repository_id` and `TF_VAR_github_repository_owner_id` here
+(defaults: this repository), and `github_repository` in
 `environments/production/terraform.tfvars`. The subject is what
 `gh api repos/<owner>/<name>/actions/oidc/customization/sub --jq .sub_claim_prefix`
 prints: repositories created since July 2026 put the owner and repository ids in it.
+The two ids are what `gh api repos/<owner>/<name> --jq '.id, .owner.id'` prints.
+Then enroll your authenticator with `scripts/deploy-gate.sh enroll`: every apply
+and deploy below needs a code from it, see the README's
+[Deploy gate](../README.md#deploy-gate).
 Then create `environments/production/backend.hcl` from `backend.hcl.example`
 with the `state_bucket` output (the file is git-ignored). Optionally move the
 bootstrap state into that bucket too: uncomment the `backend "s3"` block in
@@ -99,24 +104,18 @@ bootstrap state into that bucket too: uncomment the `backend "s3"` block in
 **A2. GitHub** (repository `gitroomhq/postiz-aws`), see the README's
 [Configuration](../README.md#configuration) table:
 
-- Variables: `TF_STATE_BUCKET`, `AWS_PLAN_ROLE_ARN` and `AWS_APPLY_ROLE_ARN`
+- Variables: `TF_STATE_BUCKET`, `AWS_PLAN_ROLE_ARN` and `DEPLOY_GATE_URL`
   (bootstrap outputs).
 - Secrets: `AWS_ACCOUNT_ID`, `ALERT_EMAILS`, `TEMPORAL_UI_DOMAIN`, `CLOUDFLARE_API_TOKEN`.
-- Environment `production` with *Deployment branches: main only* and no
-  reviewers: every push to main that touches `environments/` or `modules/`
-  applies. The apply role only trusts jobs running in it.
-- Environment `deploy` with *Deployment branches: main only* and no reviewers.
-  The deploy role only trusts jobs running in it, so pushes deploy without
-  waiting for anyone.
-- Leave the variable `AUTO_DEPLOY` unset until B14.
-- In postiz-app: commit `.github/workflows/deploy-aws.yml`. Add the secret
-  `POSTIZ_AWS_DISPATCH_TOKEN`, a fine-grained token with *Contents: read and
-  write* on `gitroomhq/postiz-aws` only. Pushes to main are ignored by
-  postiz-aws until `AUTO_DEPLOY` is set.
+- Environments `production` and `deploy`, both with *Deployment branches: main
+  only*. The deploy gate gives the apply role only to jobs in the first and the
+  deploy role only to jobs in the second.
+- `scripts/deploy-gate.sh trust`, so the gate answers runs of the commit `main`
+  is at. Repeat it after every new commit on `main`.
 
-**A3. First apply**, with every service at 0 tasks (`apps_enabled = false`). The
-first push to main that touches `environments/` or `modules/` runs it in the
-**terraform** workflow. To run it locally instead, before that push:
+**A3. First apply**, with every service at 0 tasks (`apps_enabled = false`).
+Start the **terraform** workflow with a code from the authenticator. To run it
+locally instead:
 
 ```bash
 terraform -chdir=environments/production init -backend-config=backend.hcl
@@ -126,8 +125,7 @@ terraform -chdir=environments/production apply
 Takes ~30 minutes (RDS Multi-AZ, CloudFront). Creates the Temporal UI's record
 and the ACM validation records in Cloudflare; api/mcp/platform are not touched.
 The UI answers once the apps start in B10.
-Then set the GitHub variable `AWS_DEPLOY_ROLE_ARN` from the `deploy_role_arn` output,
-and check that the hosts registered with Systems Manager (Session Manager shells
+Then check that the hosts registered with Systems Manager (Session Manager shells
 need it, for example `rotate-elastic-password` on the Elasticsearch host):
 `aws ssm describe-instance-information --query 'InstanceInformationList[].InstanceId'`
 lists the ECS hosts and the Elasticsearch host.
@@ -242,9 +240,9 @@ databases, so Postiz on AWS is used end to end before any real data moves.
 Budget the window from the A6 timings; expect roughly 45 to 90 minutes.
 
 Every "set ..., then apply" below is a change to `terraform.tfvars`. Push it to
-main and the **terraform** workflow applies it within a few minutes. A local
-apply is quicker in the window; push the same change straight after it, because
-the next push to main applies what main says and would undo a switch that only
+main, run `scripts/deploy-gate.sh trust`, and start the **terraform** workflow
+with a code. A local apply is quicker in the window; push the same change
+straight after it, because the next apply of main would undo a switch that only
 exists on your machine.
 
 | Step | Users see |
@@ -403,7 +401,7 @@ same apply.
 
 **B14. Switch deploys over:**
 
-- Set the postiz-aws variable `AUTO_DEPLOY = true`, so pushes to postiz-app main deploy to AWS.
+- From here on a deploy is a manual run of **deploy-postiz** with a code from the authenticator.
 - In Railway, disconnect the GitHub repo from the five Postiz services, so a push no longer redeploys them there.
 
 **B15. Afterwards:**
@@ -424,8 +422,8 @@ same apply.
 
 ## After the migration
 
-- **Deploys:** the **deploy-postiz** workflow (manual, or a `repository_dispatch`
-  from postiz-app on every push to main).
+- **Deploys:** the **deploy-postiz** workflow, started by hand with a code from
+  the authenticator (README, Deploy gate).
 - **Moving visibility off Elasticsearch** needs Temporal >= 1.30.1 (Amazon
   OpenSearch support). Upgrade one minor version at a time (1.28 -> 1.29 -> 1.30),
   then plan the visibility move. Do not switch the existing cluster to Postgres

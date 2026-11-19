@@ -1,13 +1,14 @@
 name: ops-image
 
 # Builds the migration toolbox (docker/ops.Dockerfile) used by the "ops" task.
+# Started by hand with a code from the authenticator, like a deploy: it pushes
+# with the deploy role, which only the deploy gate hands out (README "Deploy gate").
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - "docker/ops.Dockerfile"
-      - "scripts/**"
+    inputs:
+      otp:
+        description: 6-digit code from the authenticator
+        required: true
 
 permissions:
   contents: read
@@ -15,20 +16,33 @@ permissions:
 
 env:
   # Not used by the steps: referencing the secret makes the public logs print ***
-  # for the account id (role ARN, ECR registry).
+  # for the account id (ECR registry).
   AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+  DEPLOY_GATE_URL: ${{ vars.DEPLOY_GATE_URL }}
+  AWS_REGION: us-east-2
 
 jobs:
-  build:
-    runs-on: ${{ vars.BUILD_RUNNER || 'ubuntu-24.04-arm' }}
+  # First and fast: a code is good for about a minute.
+  authorize:
+    runs-on: ubuntu-24.04
     environment: deploy
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
 
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
-          aws-region: us-east-2
+      - name: show the code to the deploy gate
+        run: scripts/gate-ci.sh open
+
+  build:
+    needs: authorize
+    runs-on: ${{ vars.BUILD_RUNNER || 'ubuntu-24.04-arm' }}
+    environment: deploy
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: aws credentials from the deploy gate
+        run: scripts/gate-ci.sh login
 
       - name: ecr login
         id: ecr

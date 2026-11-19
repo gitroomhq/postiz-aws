@@ -8,35 +8,39 @@ name: deploy-postiz
 #   release  prisma db push (the Railway pre-deploy command) as a one-off task, then
 #            move <app>-production to the new images and restart only their services:
 #            frontend -> frontend, backend -> backend + mcp, orchestrator -> worker + worker-2
-# Manual runs build and restart every app. Rollback: run this workflow with the
-# previous commit as `ref` and skip_db_push (prisma refuses to drop columns that
-# hold data); the images of that commit are reused when they exist.
+# Rollback: run this workflow with the previous commit as `ref` and skip_db_push
+# (prisma refuses to drop columns that hold data); the images of that commit are
+# reused when they exist.
 #
-# Automatic deploys: postiz-app's .github/workflows/deploy-aws.yml sends a
-# repository_dispatch on every push to main, ignored unless the repo variable
-# AUTO_DEPLOY is "true". Pushes that arrive while a deploy runs collapse into one:
-# only the newest waits.
+# Deploys are started by hand, and each one needs a code from the authenticator
+# (README "Deploy gate"). No job has AWS credentials of its own: the first job
+# shows the code to the deploy gate, and every job after it asks the gate for the
+# deploy role (scripts/gate-ci.sh). The gate answers only a manual run on main, at
+# the commit scripts/deploy-gate.sh trust recorded, in the "deploy" GitHub
+# environment. A re-run is a new attempt and gets nothing: start a new run.
 #
-# Every job runs in the "deploy" GitHub environment (main branch only, no
-# reviewers), the only one the deploy role trusts.
+# Only commits on the app's main branch are deployed, so a code cannot be spent on
+# a branch or on a fork's pull request.
 #
-# What a run deploys: an automatic run is named after the postiz-app commit that
-# started it (title, author, short sha, sent with the dispatch), and the plan job's
-# summary links the commit, its author and its pull request for every run.
+# What a run deploys: the run is named after the ref and who started it, and the
+# plan job's summary links the commit, its author and its pull request.
 
-run-name: >-
-  ${{ github.event.client_payload.title
-  && format('{0} · {1} · {2}', github.event.client_payload.title, github.event.client_payload.author, github.event.client_payload.short_sha)
-  || github.event_name == 'repository_dispatch' && format('postiz-app {0}', github.event.client_payload.ref)
-  || format('manual: {0} by {1}', github.event.inputs.ref, github.actor) }}
+run-name: ${{ format('{0} by {1}', github.event.inputs.ref, github.actor) }}
 
 on:
   workflow_dispatch:
     inputs:
+      otp:
+        description: 6-digit code from the authenticator
+        required: true
       ref:
-        description: postiz-app branch, tag or commit
+        description: commit on postiz-app's main branch
         required: true
         default: main
+      all:
+        description: build and restart every app, changed or not
+        type: boolean
+        default: false
       build_only:
         description: push the images and move <app>-production without prisma db push or a rollout
         type: boolean
@@ -45,8 +49,6 @@ on:
         description: roll out without prisma db push (rollbacks to a release with an older schema)
         type: boolean
         default: false
-  repository_dispatch:
-    types: [deploy-postiz]
 
 permissions:
   contents: read
@@ -58,8 +60,9 @@ concurrency:
 
 env:
   # Not used by the steps: referencing the secret makes the public logs print ***
-  # for the account id (role ARN, ECR registry, task ARNs).
+  # for the account id (ECR registry, task ARNs).
   AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+  DEPLOY_GATE_URL: ${{ vars.DEPLOY_GATE_URL }}
   APP_REPOSITORY: ${{ vars.APP_REPOSITORY || 'gitroomhq/postiz-app' }}
   AWS_REGION: us-east-2
   CLUSTER: postiz-production
@@ -68,8 +71,22 @@ env:
   DB_PUSH_TASK: postiz-production-db-push
 
 jobs:
+  # First and fast: a code is good for about a minute.
+  authorize:
+    runs-on: ubuntu-24.04
+    environment: deploy
+    timeout-minutes: 5
+    steps:
+      - name: checkout infra
+        uses: actions/checkout@v4
+        with:
+          path: infra
+
+      - name: show the code to the deploy gate
+        run: infra/scripts/gate-ci.sh open
+
   plan:
-    if: github.event_name == 'workflow_dispatch' || vars.AUTO_DEPLOY == 'true'
+    needs: authorize
     runs-on: ubuntu-24.04
     environment: deploy
     timeout-minutes: 10
@@ -84,38 +101,32 @@ jobs:
         with:
           path: infra
 
-      # An automatic deploy only ships commits that are on the app's main branch,
-      # so the dispatch token cannot deploy a branch or a fork's pull request.
+      # Only commits that are on the app's main branch (main itself, or an earlier
+      # one for a rollback): the commit API also answers for branches and for the
+      # pull requests of forks, which anyone can open.
       # The summary says what is deploying: the commit, its author and the pull
-      # request it merged, read from GitHub and not from the dispatch payload.
+      # request it merged, read from GitHub.
       - name: commit
         id: commit
         env:
           APP_TOKEN: ${{ secrets.APP_REPO_TOKEN || github.token }}
-          REF: ${{ github.event.inputs.ref || github.event.client_payload.ref || 'main' }}
-          PUSHER: ${{ github.event.client_payload.pusher }}
+          REF: ${{ github.event.inputs.ref || 'main' }}
         run: |
           api() { curl -fsSL -H "Authorization: Bearer $APP_TOKEN" -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/$APP_REPOSITORY/$1"; }
           if ! [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]]; then echo "unexpected ref '$REF'" >&2; exit 1; fi
           commit=$(api "commits/$REF" || true)
           sha=$(jq -r '.sha // empty' <<< "$commit")
           if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then echo "cannot resolve '$REF' in $APP_REPOSITORY" >&2; exit 1; fi
-          if [ "$GITHUB_EVENT_NAME" = repository_dispatch ]; then
-            status=$(api "compare/$sha...main" | jq -r .status)
-            case "$status" in
-              ahead | identical) echo "$sha is on main" ;;
-              *) echo "$sha is not on main of $APP_REPOSITORY ($status), not deploying" >&2; exit 1 ;;
-            esac
-          fi
+          status=$(api "compare/$sha...main" | jq -r .status)
+          case "$status" in
+            ahead | identical) echo "$sha is on main" ;;
+            *) echo "$sha is not on main of $APP_REPOSITORY ($status), not deploying" >&2; exit 1 ;;
+          esac
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
           # never fails the deploy
           pulls=$(api "commits/$sha/pulls" 2>/dev/null) || pulls='[]'
-          by="manual run of \`$REF\` by $GITHUB_ACTOR"
-          if [ "$GITHUB_EVENT_NAME" = repository_dispatch ]; then
-            by=""
-            if [[ "$PUSHER" =~ ^[A-Za-z0-9-]+(\[bot\])?$ ]]; then by="pushed by $PUSHER"; fi
-          fi
+          by="\`$REF\`, started by $GITHUB_ACTOR"
           jq -r --arg repo "$APP_REPOSITORY" --arg by "$by" --argjson pulls "$pulls" '
             def user: if .login then "[\(.login)](\(.html_url))" else null end;
             ($pulls | map(select(.merged_at)) | first) as $pr
@@ -125,16 +136,14 @@ jobs:
               ($by | select(length > 0) | "- \(.)")
           ' <<< "$commit" | tee -a "$GITHUB_STEP_SUMMARY" || true
 
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
+      - name: aws credentials from the deploy gate
+        run: infra/scripts/gate-ci.sh login
 
       - name: plan
         id: plan
         env:
           SHA: ${{ steps.commit.outputs.sha }}
-          EVENT: ${{ github.event_name }}
+          ALL: ${{ github.event.inputs.all }}
           APP_TOKEN: ${{ secrets.APP_REPO_TOKEN || github.token }}
         run: infra/scripts/deploy-plan.sh
 
@@ -154,11 +163,13 @@ jobs:
     env:
       TAG: ${{ matrix.app }}-${{ needs.plan.outputs.sha }}
     steps:
-      - uses: aws-actions/configure-aws-credentials@v4
+      - name: checkout infra
+        uses: actions/checkout@v4
         with:
-          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
-          role-duration-seconds: 3600
-          aws-region: ${{ env.AWS_REGION }}
+          path: infra
+
+      - name: aws credentials from the deploy gate
+        run: infra/scripts/gate-ci.sh login
 
       - name: ecr login
         id: ecr
@@ -174,12 +185,6 @@ jobs:
           else
             echo "found=false" >> "$GITHUB_OUTPUT"
           fi
-
-      - name: checkout infra
-        if: steps.existing.outputs.found != 'true'
-        uses: actions/checkout@v4
-        with:
-          path: infra
 
       - name: checkout postiz-app
         if: steps.existing.outputs.found != 'true'
@@ -231,11 +236,8 @@ jobs:
         with:
           path: infra
 
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
-          role-duration-seconds: 3600
-          aws-region: ${{ env.AWS_REGION }}
+      - name: aws credentials from the deploy gate
+        run: infra/scripts/gate-ci.sh login
 
       # Runs once per deploy in its own task; the services never run it themselves.
       # The task runs :migrate. Only a successful push moves migrate-production (the

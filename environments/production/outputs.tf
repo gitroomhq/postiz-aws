@@ -75,7 +75,7 @@ output "task_definition_families" {
 }
 
 output "deploy_role_arn" {
-  description = "GitHub variable AWS_DEPLOY_ROLE_ARN"
+  description = "Handed out by the deploy gate to approved runs in the deploy environment (bootstrap variable deploy_role_name)"
   value       = aws_iam_role.deploy.arn
 }
 
