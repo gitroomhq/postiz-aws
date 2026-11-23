@@ -119,6 +119,11 @@ variable "frontend_domain" {
   type = string
 }
 
+variable "games_domain" {
+  description = "Hostname of the games site (static files in S3 behind CloudFront, games.tf), directly under cloudflare_zone_name."
+  type        = string
+}
+
 variable "temporal_ui_domain" {
   description = <<-EOT
     Hostname of the public Temporal UI, directly under cloudflare_zone_name.

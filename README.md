@@ -49,6 +49,7 @@ Cloudflare R2 (media) and RunPod (media processing) stay where they are.
 | Temporal UI + Basic Auth | temporalio/ui 2.39.0 + Caddy basic auth with the same user and password, on a random unlisted hostname like Railway's generated URL |
 | Railway variables | Secrets Manager, one JSON secret per service |
 | Resend (email) | Amazon SES in us-east-2 as postiz.com, sent with each service's task role ([ses.tf](environments/production/ses.tf)); `ses_sending_enabled` switches backend, mcp and the workers over |
+| (new) games.postiz.com | Static files of the postiz-games repository in a private S3 bucket behind CloudFront ([games.tf](environments/production/games.tf)), deployed by the `deploy-games` workflow |
 | Railway auto-deploy + pre-deploy `prisma db push` | `deploy-postiz` workflow, started by hand with a code from an authenticator: build, db push task, roll services |
 
 ### Decisions worth knowing
@@ -112,6 +113,7 @@ Fixed infrastructure at us-east-2 on-demand list prices (October 2026):
 | CloudWatch, Secrets Manager, ECR, logs bucket (estimate) | $70 | $70 |
 | AWS WAF: web ACL and 5 rules (plus $0.60 per million requests) | $10+ | $10+ |
 | Security alerts: GuardDuty (hosts, Fargate tasks, databases, API calls; plus $1 per GB of DNS logs), audit trail copy, alarms (estimate) | $50+ | $50+ |
+| games.postiz.com: S3 + CloudFront (within CloudFront's free 1 TB / 10M requests a month) | ~$1 | ~$1 |
 
 On top of that comes internet egress, $0.09/GB for the first 10 TB a month
 (the first 100 GB are free), and usually the largest line for Postiz: media
@@ -135,10 +137,12 @@ the environment:
 | GitHub secret | `TEMPORAL_UI_DOMAIN` | the Temporal UI's hostname: a random name under the zone, `temporal-<random>.postiz.com` |
 | GitHub secret | `CLOUDFLARE_API_TOKEN` | Zone > Zone > Read and Zone > DNS > Edit, both on the zone only |
 | GitHub secret | `APP_REPO_TOKEN` | optional, only if the app repo is private |
+| GitHub secret | `GAMES_REPO_TOKEN` | optional, only if the games repo is private (contents: read) |
 | GitHub variable | `TF_STATE_BUCKET` | state bucket, output of `bootstrap/` |
 | GitHub variable | `AWS_PLAN_ROLE_ARN` | output of `bootstrap/` |
 | GitHub variable | `DEPLOY_GATE_URL` | output `deploy_gate_url` of `bootstrap/`: where the workflows ask the [deploy gate](#deploy-gate) for credentials |
 | GitHub variable | `BUILD_RUNNER`, `APP_REPOSITORY` | optional: arm64 runner label, app repo (default `gitroomhq/postiz-app`) |
+| GitHub variable | `GAMES_REPOSITORY` | optional: games repo (default `gitroomhq/postiz-games`) |
 | GitHub environment | `production` | terraform apply: main branch only. The deploy gate gives the admin role only to jobs in it |
 | GitHub environment | `deploy` | deploy-postiz and ops-image: main branch only. The deploy gate gives the deploy role only to jobs in it |
 | Local shell | `TF_VAR_aws_account_id`, `TF_VAR_alert_emails`, `TF_VAR_temporal_ui_domain`, `AWS_PROFILE`, `CLOUDFLARE_API_TOKEN` | same values for local runs (an apply without `TF_VAR_alert_emails` removes the alert subscriptions) |
@@ -283,11 +287,17 @@ environments/production/   everything else; app-env-keys.json = env var names pe
 docker/                    postiz-app.Dockerfile (one image per app), postiz.Dockerfile (all-in-one, before the split), ops.Dockerfile (migration toolbox)
 scripts/                   migration, env copy, Temporal UI tunnel and CLI, read-only psql, test browser, ECR retag, deploy gate (deploy-gate.sh for you, gate-ci.sh for the workflows)
 .claude/skills/temporal/   Claude Code skill: production Temporal through scripts/temporal-cli.sh
-.github/workflows/         terraform (plan on PR, apply by hand), deploy-postiz, ops-image: all three change production only through the deploy gate
+.github/workflows/         terraform (plan on PR, apply by hand), deploy-postiz, deploy-games, ops-image: all change production only through the deploy gate
 docs/migration-runbook.md
 ```
 
 ## Day to day
+
+**Games (games.postiz.com):** Actions > **deploy-games** > Run workflow with a
+code and a commit of postiz-games' `main` (default `main`). It uploads the files
+(HTML revalidates on every visit, the rest is cached an hour in browsers) and
+clears the CloudFront cache; a rollback is the same run with an older commit.
+To add a game, change only the postiz-games repository.
 
 **Infrastructure changes:** open a PR to see the plan first: CI runs fmt,
 validate, the offline test and a plan (summary commented on the PR). Nothing

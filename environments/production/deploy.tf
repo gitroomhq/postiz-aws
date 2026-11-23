@@ -115,6 +115,32 @@ data "aws_iam_policy_document" "deploy" {
     resources = ["${module.db_push.log_group_arn}:*"]
   }
 
+  # deploy-games.yml: upload postiz-games to its bucket and clear the CloudFront cache.
+  statement {
+    sid       = "ListGames"
+    actions   = ["s3:ListBucket"]
+    resources = [aws_s3_bucket.games.arn]
+  }
+
+  statement {
+    sid       = "UploadGames"
+    actions   = ["s3:PutObject", "s3:DeleteObject"]
+    resources = ["${aws_s3_bucket.games.arn}/*"]
+  }
+
+  # the workflow finds the distribution by its domain name
+  statement {
+    sid       = "FindGamesDistribution"
+    actions   = ["cloudfront:ListDistributions"]
+    resources = ["*"]
+  }
+
+  statement {
+    sid       = "RefreshGamesCache"
+    actions   = ["cloudfront:CreateInvalidation", "cloudfront:GetInvalidation"]
+    resources = [aws_cloudfront_distribution.games.arn]
+  }
+
   # The build only keeps the NEXT_PUBLIC_* keys (they end up in the browser bundle).
   statement {
     sid       = "ReadFrontendBuildValues"

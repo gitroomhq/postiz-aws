@@ -1,0 +1,126 @@
+name: deploy-games
+
+# games.postiz.com (environments/production/games.tf): uploads a commit of the
+# postiz-games repository to its S3 bucket and clears the CloudFront cache.
+# Plain static files, no build.
+#
+# Like deploy-postiz: started by hand with a code from the authenticator (README
+# "Deploy gate"), credentials only from the gate (deploy role), and only commits
+# on the games repository's main branch are deployed.
+# Rollback: run it again with the previous commit as `ref` (the bucket also keeps
+# every replaced file for 7 days).
+
+run-name: ${{ format('games {0} by {1}', github.event.inputs.ref, github.actor) }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      otp:
+        description: 6-digit code from the authenticator
+        required: true
+      ref:
+        description: commit on postiz-games' main branch
+        required: true
+        default: main
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-games
+  cancel-in-progress: false
+
+env:
+  # Not used by the steps: referencing the secret makes the public logs print ***
+  # for the account id (it is part of the bucket name).
+  AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+  DEPLOY_GATE_URL: ${{ vars.DEPLOY_GATE_URL }}
+  GAMES_REPOSITORY: ${{ vars.GAMES_REPOSITORY || 'gitroomhq/postiz-games' }}
+  GAMES_DOMAIN: games.postiz.com
+  AWS_REGION: us-east-2
+
+jobs:
+  # First and fast: a code is good for about a minute.
+  authorize:
+    runs-on: ubuntu-24.04
+    environment: deploy
+    timeout-minutes: 5
+    steps:
+      - name: checkout infra
+        uses: actions/checkout@v4
+        with:
+          path: infra
+
+      - name: show the code to the deploy gate
+        run: infra/scripts/gate-ci.sh open
+
+  deploy:
+    needs: authorize
+    runs-on: ubuntu-24.04
+    environment: deploy
+    timeout-minutes: 20
+    steps:
+      - name: checkout infra
+        uses: actions/checkout@v4
+        with:
+          path: infra
+
+      # Only commits on the games repository's main branch (main itself, or an
+      # earlier one for a rollback).
+      - name: commit
+        id: commit
+        env:
+          GAMES_TOKEN: ${{ secrets.GAMES_REPO_TOKEN || github.token }}
+          REF: ${{ github.event.inputs.ref || 'main' }}
+        run: |
+          api() { curl -fsSL -H "Authorization: Bearer $GAMES_TOKEN" -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/$GAMES_REPOSITORY/$1"; }
+          if ! [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]]; then echo "unexpected ref '$REF'" >&2; exit 1; fi
+          commit=$(api "commits/$REF" || true)
+          sha=$(jq -r '.sha // empty' <<< "$commit")
+          if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then echo "cannot resolve '$REF' in $GAMES_REPOSITORY" >&2; exit 1; fi
+          status=$(api "compare/$sha...main" | jq -r .status)
+          case "$status" in
+            ahead | identical) echo "$sha is on main" ;;
+            *) echo "$sha is not on main of $GAMES_REPOSITORY ($status), not deploying" >&2; exit 1 ;;
+          esac
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          jq -r --arg repo "$GAMES_REPOSITORY" --arg by "started by $GITHUB_ACTOR" '
+            "### \(.commit.message | split("\n") | first)",
+            "- commit [`\(.sha[0:12])`](\(.html_url)) of \($repo) by \(.commit.author.name), \(.commit.author.date | sub("T"; " ") | sub(":[0-9]+Z$"; " UTC"))",
+            "- \($by)"
+          ' <<< "$commit" | tee -a "$GITHUB_STEP_SUMMARY" || true
+
+      - name: checkout games
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.GAMES_REPOSITORY }}
+          ref: ${{ steps.commit.outputs.sha }}
+          token: ${{ secrets.GAMES_REPO_TOKEN || github.token }}
+          path: games
+          persist-credentials: false
+
+      - name: aws credentials from the deploy gate
+        run: infra/scripts/gate-ci.sh login
+
+      # HTML revalidates on every visit; everything else keeps an hour in the
+      # browser (the games bust their own scripts and videos with ?v=). Repository
+      # files that are not part of the site stay out of the bucket.
+      - name: upload
+        run: |
+          account=$(aws sts get-caller-identity --query Account --output text)
+          bucket="postiz-production-games-$account"
+          skip=(--exclude '.*' --exclude '*/.*' --exclude 'scripts/*' --exclude 'README.md' --exclude 'CNAME')
+          aws s3 sync games/ "s3://$bucket/" --delete --no-progress "${skip[@]}" --exclude '*.html' \
+            --cache-control 'public, max-age=3600'
+          aws s3 sync games/ "s3://$bucket/" --delete --no-progress "${skip[@]}" --exclude '*' --include '*.html' \
+            --cache-control 'no-cache'
+
+      - name: clear the CloudFront cache
+        run: |
+          id=$(aws cloudfront list-distributions \
+            --query "DistributionList.Items[?Aliases.Items && contains(Aliases.Items, '$GAMES_DOMAIN')].Id | [0]" --output text)
+          if ! [[ "$id" =~ ^E[A-Z0-9]+$ ]]; then echo "no CloudFront distribution for $GAMES_DOMAIN" >&2; exit 1; fi
+          inv=$(aws cloudfront create-invalidation --distribution-id "$id" --paths '/*' --query Invalidation.Id --output text)
+          aws cloudfront wait invalidation-completed --distribution-id "$id" --id "$inv"
+          echo "- live on https://$GAMES_DOMAIN" | tee -a "$GITHUB_STEP_SUMMARY"
