@@ -126,6 +126,41 @@ resource "aws_acm_certificate_validation" "games" {
   depends_on      = [cloudflare_dns_record.acm_validation]
 }
 
+# The same site on hostnames outside the Cloudflare zone (games_extra_domains, e.g. games.postiz.co,
+# whose DNS is at its registrar). A second certificate covers every name; it is requested first and
+# validated by records added by hand, and the distribution switches to it only with
+# games_extra_domains_live = true, so no apply ever waits on a record that is not there yet.
+locals {
+  games_extra = length(var.games_extra_domains) > 0
+  games_live  = local.games_extra && var.games_extra_domains_live
+  games_extra_validation = local.games_extra ? {
+    for dvo in aws_acm_certificate.games_all[0].domain_validation_options : dvo.domain_name => {
+      name  = dvo.resource_record_name
+      type  = dvo.resource_record_type
+      value = dvo.resource_record_value
+    }
+  } : {}
+}
+
+resource "aws_acm_certificate" "games_all" {
+  count                     = local.games_extra ? 1 : 0
+  provider                  = aws.us_east_1
+  domain_name               = var.games_domain
+  subject_alternative_names = var.games_extra_domains
+  validation_method         = "DNS"
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_acm_certificate_validation" "games_all" {
+  count           = local.games_live ? 1 : 0
+  provider        = aws.us_east_1
+  certificate_arn = aws_acm_certificate.games_all[0].arn
+  depends_on      = [cloudflare_dns_record.acm_validation]
+}
+
 # S3 has no directory index behind CloudFront: /game/ -> /game/index.html, and
 # /game -> 301 /game/ so a game's relative asset paths resolve inside its folder.
 resource "aws_cloudfront_function" "games_index" {
@@ -165,7 +200,7 @@ data "aws_cloudfront_response_headers_policy" "security_headers" {
 resource "aws_cloudfront_distribution" "games" {
   enabled             = true
   comment             = var.games_domain
-  aliases             = [var.games_domain]
+  aliases             = concat([var.games_domain], local.games_live ? var.games_extra_domains : [])
   is_ipv6_enabled     = true
   http_version        = "http2and3"
   price_class         = "PriceClass_All"
@@ -209,7 +244,7 @@ resource "aws_cloudfront_distribution" "games" {
   }
 
   viewer_certificate {
-    acm_certificate_arn      = aws_acm_certificate_validation.games.certificate_arn
+    acm_certificate_arn      = local.games_live ? aws_acm_certificate_validation.games_all[0].certificate_arn : aws_acm_certificate_validation.games.certificate_arn
     ssl_support_method       = "sni-only"
     minimum_protocol_version = "TLSv1.2_2021"
   }

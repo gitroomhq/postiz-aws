@@ -686,6 +686,10 @@ run "security_fargate_monitoring_off" {
 run "games_site" {
   command = plan
 
+  variables {
+    games_extra_domains_live = false
+  }
+
   assert {
     condition     = cloudflare_dns_record.games.name == "games.postiz.com" && cloudflare_dns_record.games.proxied == false
     error_message = "games.postiz.com should be a DNS-only record, independent of dns_cutover"
@@ -700,4 +704,86 @@ run "games_site" {
     condition     = aws_s3_bucket_public_access_block.games.restrict_public_buckets && aws_s3_bucket_public_access_block.games.block_public_policy
     error_message = "the games bucket must stay private (CloudFront reads it through origin access control)"
   }
+}
+
+# games.postiz.co: DNS outside Cloudflare. Before it is live nothing changes for games.postiz.com and the
+# validation record is only listed for adding by hand; once live the distribution answers on both names.
+run "games_extra_domain_pending" {
+  command = plan
+
+  variables {
+    games_extra_domains      = ["games.postiz.co"]
+    games_extra_domains_live = false
+  }
+
+  # the existing certificate's record, and a different one for the new certificate's games.postiz.com:
+  # the existing one must stay
+  override_resource {
+    target          = aws_acm_certificate.games
+    override_during = plan
+    values = {
+      arn = "arn:aws:acm:us-east-1:123456789012:certificate/22222222-2222-2222-2222-222222222222"
+      domain_validation_options = [
+        { domain_name = "games.postiz.com", resource_record_name = "_abc.games.postiz.com.", resource_record_type = "CNAME", resource_record_value = "_def.acm-validations.aws." },
+      ]
+    }
+  }
+
+  override_resource {
+    target          = aws_acm_certificate.games_all[0]
+    override_during = plan
+    values = {
+      arn = "arn:aws:acm:us-east-1:123456789012:certificate/11111111-1111-1111-1111-111111111111"
+      domain_validation_options = [
+        { domain_name = "games.postiz.com", resource_record_name = "_new.games.postiz.com.", resource_record_type = "CNAME", resource_record_value = "_new.acm-validations.aws." },
+        { domain_name = "games.postiz.co", resource_record_name = "_ghi.games.postiz.co.", resource_record_type = "CNAME", resource_record_value = "_jkl.acm-validations.aws." },
+      ]
+    }
+  }
+
+  assert {
+    condition     = aws_cloudfront_distribution.games.aliases == toset(["games.postiz.com"]) && length(aws_acm_certificate_validation.games_all) == 0
+    error_message = "until games_extra_domains_live, the distribution keeps its one name and nothing waits for the new certificate"
+  }
+
+  assert {
+    condition     = !contains(keys(cloudflare_dns_record.acm_validation), "games.postiz.co")
+    error_message = "Cloudflare only gets validation records for names in its own zone"
+  }
+
+  # the live games.postiz.com record stays the one of the first certificate (not replaced by the new one's)
+  assert {
+    condition     = cloudflare_dns_record.acm_validation["games.postiz.com"].name == "_abc.games.postiz.com"
+    error_message = "games.postiz.com keeps its existing validation record"
+  }
+
+  assert {
+    condition     = [for r in output.games_manual_dns_records : r.name] == ["_ghi.games.postiz.co", "games.postiz.co"]
+    error_message = "the manual records are the .co validation record and the .co CNAME"
+  }
+}
+
+run "games_extra_domain_live" {
+  command = plan
+
+  variables {
+    games_extra_domains      = ["games.postiz.co"]
+    games_extra_domains_live = true
+  }
+
+  assert {
+    condition     = aws_cloudfront_distribution.games.aliases == toset(["games.postiz.com", "games.postiz.co"]) && length(aws_acm_certificate_validation.games_all) == 1
+    error_message = "once live, the distribution answers on both names with the certificate that covers them"
+  }
+}
+
+run "games_extra_domain_live_needs_a_name" {
+  command = plan
+
+  variables {
+    games_extra_domains      = []
+    games_extra_domains_live = true
+  }
+
+  expect_failures = [var.games_extra_domains_live]
 }

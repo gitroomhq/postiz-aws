@@ -124,6 +124,28 @@ variable "games_domain" {
   type        = string
 }
 
+variable "games_extra_domains" {
+  description = <<-EOT
+    More hostnames that serve the games site, in zones that are not on Cloudflare: their DNS
+    records are added by hand (output games_manual_dns_records). Two steps: list a name here and
+    apply (a certificate for it is requested), add the records the output shows, then set
+    games_extra_domains_live = true and apply again.
+  EOT
+  type        = list(string)
+  default     = []
+}
+
+variable "games_extra_domains_live" {
+  description = "The games distribution answers on games_extra_domains, with the certificate that covers them. Only once their validation records exist (see games_extra_domains)."
+  type        = bool
+  default     = false
+
+  validation {
+    condition     = !var.games_extra_domains_live || length(var.games_extra_domains) > 0
+    error_message = "games_extra_domains_live needs at least one name in games_extra_domains."
+  }
+}
+
 variable "temporal_ui_domain" {
   description = <<-EOT
     Hostname of the public Temporal UI, directly under cloudflare_zone_name.

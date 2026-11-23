@@ -31,6 +31,14 @@ locals {
         value = dvo.resource_record_value
       }
     },
+    # games_all: its names inside the Cloudflare zone, except games_domain, whose record above already
+    # validates it (ACM uses one record per name per account; listing it again would replace that
+    # record with one only known after apply). Names outside the zone are added by hand (output
+    # games_manual_dns_records).
+    {
+      for name, r in local.games_extra_validation : name => r
+      if endswith(name, ".${var.cloudflare_zone_name}") && name != var.games_domain
+    },
   )
 
   # The Temporal UI's unlisted name (only when public) exists from day one. The

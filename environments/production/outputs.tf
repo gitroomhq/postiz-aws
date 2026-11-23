@@ -110,6 +110,14 @@ output "games_bucket" {
   value       = aws_s3_bucket.games.id
 }
 
+output "games_manual_dns_records" {
+  description = "Records to add by hand at the DNS host of games_extra_domains: certificate validation, and the name itself (CNAME to CloudFront)"
+  value = concat(
+    [for name, r in local.games_extra_validation : { purpose = "certificate validation for ${name}", type = r.type, name = trimsuffix(r.name, "."), value = trimsuffix(r.value, ".") } if !endswith(name, ".${var.cloudflare_zone_name}")],
+    [for name in var.games_extra_domains : { purpose = "serves ${name}", type = "CNAME", name = name, value = aws_cloudfront_distribution.games.domain_name }],
+  )
+}
+
 output "games_distribution_id" {
   description = "CloudFront distribution of games_domain (deploy-games.yml clears its cache)"
   value       = aws_cloudfront_distribution.games.id
