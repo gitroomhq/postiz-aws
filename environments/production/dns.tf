@@ -31,6 +31,9 @@ locals {
         value = dvo.resource_record_value
       }
     },
+    # games_all: only its names inside the Cloudflare zone (the same record as above for games_domain);
+    # the others are added by hand (output games_manual_dns_records)
+    { for name, r in local.games_extra_validation : name => r if endswith(name, ".${var.cloudflare_zone_name}") },
   )
 
   # The Temporal UI's unlisted name (only when public) exists from day one. The

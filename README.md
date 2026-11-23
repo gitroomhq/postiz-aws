@@ -299,6 +299,19 @@ code and a commit of postiz-games' `main` (default `main`). It uploads the files
 clears the CloudFront cache; a rollback is the same run with an older commit.
 To add a game, change only the postiz-games repository.
 
+**Games on more domains** (games.postiz.co, DNS at Dynadot rather than Cloudflare): the site
+answers on every name in `games_extra_domains`, in two applies so none of them waits on a
+record that is not there yet:
+1. The name is in `games_extra_domains` with `games_extra_domains_live = false` and applied:
+   a certificate covering it is requested. The end of the apply log lists
+   `games_manual_dns_records` (or `terraform output games_manual_dns_records`): a validation
+   CNAME and the name's own CNAME to CloudFront. Add both at Dynadot.
+2. Once the certificate shows *Issued* (ACM in us-east-1, usually minutes after the records
+   exist): set `games_extra_domains_live = true`, merge, apply. The distribution switches to
+   that certificate and answers on the extra names too.
+
+Game saves live in the browser per domain, so a player has separate saves on each name.
+
 **Infrastructure changes:** open a PR to see the plan first: CI runs fmt,
 validate, the offline test and a plan (summary commented on the PR). Nothing
 applies on a merge. To apply what `main` holds: `scripts/deploy-gate.sh trust`

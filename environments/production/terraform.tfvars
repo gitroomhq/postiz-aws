@@ -28,6 +28,9 @@ api_domain           = "api.postiz.com"
 mcp_domain           = "mcp.postiz.com"
 frontend_domain      = "platform.postiz.com"
 games_domain         = "games.postiz.com"
+# DNS at Dynadot, records added by hand (README "Games on more domains")
+games_extra_domains      = ["games.postiz.co"]
+games_extra_domains_live = false
 
 # The Temporal UI as on Railway: basic auth on a random, unlisted hostname
 # (TF_VAR_temporal_ui_domain; CI: secret TEMPORAL_UI_DOMAIN)
