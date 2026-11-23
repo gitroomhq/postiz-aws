@@ -24,6 +24,13 @@ locals {
         value = dvo.resource_record_value
       }
     },
+    {
+      for dvo in aws_acm_certificate.games.domain_validation_options : dvo.domain_name => {
+        name  = dvo.resource_record_name
+        type  = dvo.resource_record_type
+        value = dvo.resource_record_value
+      }
+    },
   )
 
   # The Temporal UI's unlisted name (only when public) exists from day one. The

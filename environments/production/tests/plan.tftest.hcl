@@ -30,6 +30,9 @@ mock_provider "aws" {
   mock_data "aws_cloudfront_cache_policy" {
     defaults = { id = "658327ea-f89d-4fab-a63d-7e88639e58f6" }
   }
+  mock_data "aws_cloudfront_response_headers_policy" {
+    defaults = { id = "67f7725c-6f97-4210-82d7-5512b31e9d03" }
+  }
   mock_data "aws_cloudfront_origin_request_policy" {
     defaults = { id = "216adef6-5c7f-47e4-b989-5492eafa07d3" }
   }
@@ -677,5 +680,24 @@ run "security_fargate_monitoring_off" {
       EKS_ADDON_MANAGEMENT         = "DISABLED"
     }
     error_message = "guardduty_fargate_monitoring = false keeps the agent on the hosts and out of the Fargate tasks"
+  }
+}
+
+run "games_site" {
+  command = plan
+
+  assert {
+    condition     = cloudflare_dns_record.games.name == "games.postiz.com" && cloudflare_dns_record.games.proxied == false
+    error_message = "games.postiz.com should be a DNS-only record, independent of dns_cutover"
+  }
+
+  assert {
+    condition     = aws_cloudfront_distribution.games.aliases == toset(["games.postiz.com"]) && aws_cloudfront_distribution.games.default_root_object == "index.html"
+    error_message = "the games distribution should serve games.postiz.com with index.html at the root"
+  }
+
+  assert {
+    condition     = aws_s3_bucket_public_access_block.games.restrict_public_buckets && aws_s3_bucket_public_access_block.games.block_public_policy
+    error_message = "the games bucket must stay private (CloudFront reads it through origin access control)"
   }
 }

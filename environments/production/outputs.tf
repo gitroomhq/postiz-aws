@@ -104,3 +104,13 @@ output "migration_upload_role_arn" {
   description = "Assume it right before an export; its temporary keys go into the Railway toolbox"
   value       = aws_iam_role.migration_upload.arn
 }
+
+output "games_bucket" {
+  description = "S3 bucket behind games_domain (deploy-games.yml uploads to it)"
+  value       = aws_s3_bucket.games.id
+}
+
+output "games_distribution_id" {
+  description = "CloudFront distribution of games_domain (deploy-games.yml clears its cache)"
+  value       = aws_cloudfront_distribution.games.id
+}

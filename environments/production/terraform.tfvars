@@ -27,6 +27,7 @@ cloudflare_zone_name = "postiz.com"
 api_domain           = "api.postiz.com"
 mcp_domain           = "mcp.postiz.com"
 frontend_domain      = "platform.postiz.com"
+games_domain         = "games.postiz.com"
 
 # The Temporal UI as on Railway: basic auth on a random, unlisted hostname
 # (TF_VAR_temporal_ui_domain; CI: secret TEMPORAL_UI_DOMAIN)
