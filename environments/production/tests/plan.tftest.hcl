@@ -716,13 +716,26 @@ run "games_extra_domain_pending" {
     games_extra_domains_live = false
   }
 
+  # the existing certificate's record, and a different one for the new certificate's games.postiz.com:
+  # the existing one must stay
+  override_resource {
+    target          = aws_acm_certificate.games
+    override_during = plan
+    values = {
+      arn = "arn:aws:acm:us-east-1:123456789012:certificate/22222222-2222-2222-2222-222222222222"
+      domain_validation_options = [
+        { domain_name = "games.postiz.com", resource_record_name = "_abc.games.postiz.com.", resource_record_type = "CNAME", resource_record_value = "_def.acm-validations.aws." },
+      ]
+    }
+  }
+
   override_resource {
     target          = aws_acm_certificate.games_all[0]
     override_during = plan
     values = {
       arn = "arn:aws:acm:us-east-1:123456789012:certificate/11111111-1111-1111-1111-111111111111"
       domain_validation_options = [
-        { domain_name = "games.postiz.com", resource_record_name = "_abc.games.postiz.com.", resource_record_type = "CNAME", resource_record_value = "_def.acm-validations.aws." },
+        { domain_name = "games.postiz.com", resource_record_name = "_new.games.postiz.com.", resource_record_type = "CNAME", resource_record_value = "_new.acm-validations.aws." },
         { domain_name = "games.postiz.co", resource_record_name = "_ghi.games.postiz.co.", resource_record_type = "CNAME", resource_record_value = "_jkl.acm-validations.aws." },
       ]
     }
@@ -736,6 +749,12 @@ run "games_extra_domain_pending" {
   assert {
     condition     = !contains(keys(cloudflare_dns_record.acm_validation), "games.postiz.co")
     error_message = "Cloudflare only gets validation records for names in its own zone"
+  }
+
+  # the live games.postiz.com record stays the one of the first certificate (not replaced by the new one's)
+  assert {
+    condition     = cloudflare_dns_record.acm_validation["games.postiz.com"].name == "_abc.games.postiz.com"
+    error_message = "games.postiz.com keeps its existing validation record"
   }
 
   assert {
