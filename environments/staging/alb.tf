@@ -2,7 +2,7 @@
 #   443   platform, api and mcp. With client_certificates_required, mutual TLS in
 #         verify mode: the load balancer ends every connection that does not
 #         present a certificate signed by the staging CA (client_ca_file,
-#         scripts/staging-certs.sh), before any request reaches the app. The app
+#         scripts/staging-certs.py), before any request reaches the app. The app
 #         behind it behaves as production's does, which has no such door.
 #   8443  Stripe's webhooks only: no certificate (Stripe has none to give), only
 #         Stripe's addresses (network.tf), only POST /stripe on the API's name;
@@ -111,7 +111,7 @@ resource "aws_s3_bucket_policy" "alb_logs" {
 # --- the client certificate authority ------------------------------------------------------
 # Only the CA's certificate is here (public by nature, committed as
 # client_ca_file). Its private key is in Secrets Manager under
-# postiz/staging-admin/client-ca, which no task can read; scripts/staging-certs.sh
+# postiz/staging-admin/client-ca, which no task can read; scripts/staging-certs.py
 # issues and revokes certificates with it and uploads the revocation list to this
 # bucket (revocations are the script's, not Terraform's).
 
@@ -152,9 +152,9 @@ resource "aws_s3_bucket_versioning" "trust_store" {
   }
 }
 
+# Kept while client certificates are off too, so its revocation list survives a
+# pentest without certificates; a trust store only costs while a listener uses it.
 resource "aws_s3_object" "client_ca" {
-  count = var.client_certificates_required ? 1 : 0
-
   bucket       = aws_s3_bucket.trust_store.id
   key          = "client-ca.pem"
   source       = "${path.module}/${var.client_ca_file}"
@@ -166,18 +166,16 @@ resource "aws_s3_object" "client_ca" {
   lifecycle {
     precondition {
       condition     = fileexists("${path.module}/${var.client_ca_file}")
-      error_message = "No client CA in environments/staging/${var.client_ca_file}: run scripts/staging-certs.sh init and commit the file it writes (docs/staging.md)."
+      error_message = "No client CA in environments/staging/${var.client_ca_file}: run scripts/staging-certs.py init and commit the file it writes (docs/staging.md)."
     }
   }
 }
 
 resource "aws_lb_trust_store" "clients" {
-  count = var.client_certificates_required ? 1 : 0
-
   name                                     = "${local.name}-clients"
   ca_certificates_bundle_s3_bucket         = aws_s3_bucket.trust_store.id
-  ca_certificates_bundle_s3_key            = aws_s3_object.client_ca[0].key
-  ca_certificates_bundle_s3_object_version = aws_s3_object.client_ca[0].version_id
+  ca_certificates_bundle_s3_key            = aws_s3_object.client_ca.key
+  ca_certificates_bundle_s3_object_version = aws_s3_object.client_ca.version_id
 }
 
 # --- load balancer ------------------------------------------------------------------------
@@ -225,7 +223,7 @@ resource "aws_lb_listener" "https" {
 
   mutual_authentication {
     mode                             = var.client_certificates_required ? "verify" : "off"
-    trust_store_arn                  = var.client_certificates_required ? aws_lb_trust_store.clients[0].arn : null
+    trust_store_arn                  = var.client_certificates_required ? aws_lb_trust_store.clients.arn : null
     ignore_client_certificate_expiry = var.client_certificates_required ? false : null
     # browsers then offer only certificates of this CA
     advertise_trust_store_ca_names = var.client_certificates_required ? "on" : null

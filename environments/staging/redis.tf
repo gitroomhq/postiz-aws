@@ -50,6 +50,9 @@ resource "aws_elasticache_replication_group" "redis" {
   transit_encryption_mode    = "required"
   auth_token_wo              = ephemeral.random_password.redis.result
   auth_token_wo_version      = var.redis_auth_token_version
+  # a rotation replaces the token at once (the default, ROTATE, keeps the old one
+  # working too); the services get the new REDIS_URL when they restart
+  auth_token_update_strategy = "SET"
 
   snapshot_retention_limit = 0
   maintenance_window       = "sun:09:00-sun:10:00"

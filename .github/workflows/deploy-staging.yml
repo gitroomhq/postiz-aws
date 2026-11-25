@@ -134,16 +134,22 @@ jobs:
           ref: ${{ needs.plan.outputs.sha }}
           token: ${{ secrets.APP_REPO_TOKEN || github.token }}
           path: app
+          # the build context is this directory: no token in its .git/config
+          persist-credentials: false
 
       - name: frontend build values
         if: steps.existing.outputs.found != 'true' && matrix.app == 'frontend'
         # only NEXT_PUBLIC_* keys of staging's own frontend secret, shell-quoted, as a BuildKit secret
+        # a failed read must fail the build, not ship a frontend without its values
         run: |
+          set -o pipefail
           aws secretsmanager get-secret-value --secret-id postiz/staging/frontend \
             --query SecretString --output text \
             | jq -r 'to_entries[] | select(.key | startswith("NEXT_PUBLIC_")) | "\(.key)=\(.value | @sh)"' \
             > "$RUNNER_TEMP/frontend.env"
-          echo "$(wc -l < "$RUNNER_TEMP/frontend.env") NEXT_PUBLIC_* values"
+          count=$(wc -l < "$RUNNER_TEMP/frontend.env")
+          echo "$count NEXT_PUBLIC_* values"
+          [ "$count" -gt 0 ] || { echo "postiz/staging/frontend has no NEXT_PUBLIC_* keys (scripts/staging-secrets.py fill)" >&2; exit 1; }
 
       - uses: docker/setup-buildx-action@v3
         if: steps.existing.outputs.found != 'true'
@@ -239,7 +245,9 @@ jobs:
             aws logs get-log-events --log-group-name "/ecs/$CLUSTER/$name" \
               --log-stream-name "$name/$name/${task##*/}" --query 'events[].message' --output text | tr '\t' '\n' | tail -50 || true
             local code reason
-            code=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$task" --query 'tasks[0].containers[0].exitCode' --output text)
+            # by name: GuardDuty adds its agent to the task as another container
+            code=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$task" \
+              --query "tasks[0].containers[?name=='$name'].exitCode | [0]" --output text)
             reason=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$task" --query 'tasks[0].stoppedReason' --output text)
             echo "exit code: $code ($reason)"
             [ "$code" = "0" ]

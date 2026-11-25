@@ -34,8 +34,8 @@ output "apps_security_group_id" {
 }
 
 output "trust_store_arn" {
-  description = "scripts/staging-certs.sh updates its revocation list"
-  value       = one(aws_lb_trust_store.clients[*].arn)
+  description = "scripts/staging-certs.py updates its revocation list"
+  value       = aws_lb_trust_store.clients.arn
 }
 
 output "trust_store_bucket" {

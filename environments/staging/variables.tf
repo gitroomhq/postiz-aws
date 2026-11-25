@@ -66,7 +66,7 @@ variable "frontend_domain" {
 # --- who gets in ------------------------------------------------------------------------
 
 variable "client_ca_file" {
-  description = "The certificate authority whose client certificates the load balancer accepts, relative to this directory. scripts/staging-certs.sh init writes it."
+  description = "The certificate authority whose client certificates the load balancer accepts, relative to this directory. scripts/staging-certs.py init writes it."
   type        = string
   default     = "client-ca.pem"
 }
@@ -83,13 +83,13 @@ variable "client_certificates_required" {
 }
 
 variable "open_to_cidrs" {
-  description = "Without client certificates, the only addresses port 443 accepts. Never 0.0.0.0/0."
+  description = "Without client certificates, the only addresses port 443 accepts: IPv4 ranges of /16 or narrower."
   type        = list(string)
   default     = []
 
   validation {
-    condition     = !contains(var.open_to_cidrs, "0.0.0.0/0")
-    error_message = "open_to_cidrs must name addresses: 0.0.0.0/0 would put staging on the internet without a certificate check."
+    condition     = alltrue([for c in var.open_to_cidrs : can(cidrhost(c, 0)) && can(regex("^[0-9.]+/[0-9]+$", c)) && tonumber(split("/", c)[1]) >= 16])
+    error_message = "open_to_cidrs must name addresses (IPv4, /16 or narrower): anything wider would put staging on the internet without a certificate check."
   }
 }
 

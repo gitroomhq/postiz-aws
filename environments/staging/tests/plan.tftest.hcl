@@ -60,7 +60,7 @@ run "new_environment" {
   }
 
   assert {
-    condition     = aws_lb_listener.https.mutual_authentication[0].mode == "verify" && length(aws_lb_trust_store.clients) == 1
+    condition     = aws_lb_listener.https.mutual_authentication[0].mode == "verify"
     error_message = "port 443 must ask every connection for a client certificate"
   }
 
@@ -133,8 +133,8 @@ run "pentest_without_certificates" {
   }
 
   assert {
-    condition     = aws_lb_listener.https.mutual_authentication[0].mode == "off" && length(aws_lb_trust_store.clients) == 0
-    error_message = "without certificates, no trust store and no check"
+    condition     = aws_lb_listener.https.mutual_authentication[0].mode == "off" && aws_lb_trust_store.clients.name == "postiz-staging-clients"
+    error_message = "without certificates no check, but the trust store and its revocations stay for when they come back"
   }
 
   assert {
@@ -152,4 +152,15 @@ run "never_open_to_everyone" {
   }
 
   expect_failures = [aws_lb.main]
+}
+
+run "never_a_wide_allowlist" {
+  command = plan
+
+  variables {
+    client_certificates_required = false
+    open_to_cidrs                = ["0.0.0.0/1", "128.0.0.0/1"]
+  }
+
+  expect_failures = [var.open_to_cidrs]
 }

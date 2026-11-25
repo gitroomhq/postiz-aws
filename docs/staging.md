@@ -44,7 +44,8 @@ names the certificate of every connection.
 Send the .p12 and its password by different channels. Install: double-click it
 (macOS Keychain, Windows); Chrome and Safari then offer it when a staging page
 asks. Burp: Settings > Network > TLS > Client TLS certificates, host
-`*.getpostiz.com`. curl: `openssl pkcs12 -in dana.p12 -nodes > me.pem`, then
+`*.getpostiz.com`. curl: `(umask 077; openssl pkcs12 -in dana.p12 -nodes -out me.pem)`
+(the key comes out unencrypted, so the file must be yours alone), then
 `curl --cert me.pem https://api.getpostiz.com/`.
 
 Use a Chromium browser (Chrome, Edge, Brave, Burp's built-in one). The app at
@@ -61,7 +62,9 @@ short for people outside the team.
 
 Without certificates (a pentest whose tools cannot present one): set
 `client_certificates_required = false` and `open_to_cidrs` to their fixed
-addresses, apply, and switch back afterwards. Plain 0.0.0.0/0 is refused.
+addresses (IPv4, /16 or narrower: anything wider is refused), apply, and switch
+back afterwards. The trust store and its revocation list stay in place meanwhile,
+so a revoked certificate is still refused when the check comes back.
 
 The one door without a certificate is Stripe's: port 8443 accepts only Stripe's
 webhook addresses and forwards only `POST /stripe` on api.getpostiz.com; the app
@@ -116,7 +119,8 @@ Once, in this order. Steps marked (mgmt) need the management account
    (proxied CNAMEs to a Railway app that no longer exists). Terraform creates
    new ones and a name can only have one CNAME.
 
-7. **Client CA**: `scripts/staging-certs.py init`, then commit
+7. **Client CA**: `export AWS_PROFILE=postiz-staging STAGING_ACCOUNT_ID=<staging account id>`,
+   `scripts/staging-certs.py init`, then commit
    `environments/staging/client-ca.pem` (public by nature; the key stays in
    Secrets Manager under `postiz/staging-admin/`, which no task can read).
 
@@ -158,14 +162,20 @@ Once, in this order. Steps marked (mgmt) need the management account
 - Temporal UI: `AWS_PROFILE=postiz-staging scripts/staging-temporal-ui.sh`, then http://localhost:8080.
 - A shell in a container: `aws ecs execute-command --cluster postiz-staging --task <id> --container backend --interactive --command sh`
   (it sends a security alert, on purpose).
-- Rotate the database or Valkey passwords: bump the `*_version` variable, apply,
-  deploy with `init_database` (database), and the services pick them up.
+- Rotate the database or Valkey passwords: bump the `*_version` variable and
+  apply, then deploy with `init_database` (database passwords; it rolls backend,
+  frontend and worker), and restart Temporal for its own:
+  `aws ecs update-service --cluster postiz-staging --service temporal --force-new-deployment`.
+  Valkey takes the new token at once (no overlap), so the apps fail on Valkey until
+  they restart: deploy (or force a new deployment) right after the apply.
 
 ## Shared production keys
 
 Some providers allow one app only, so staging may use production's OAuth app
 for them. List each such key under `shared` in
-`environments/staging/shared-keys.json` and run `staging-secrets.py fill`. Whoever
+`environments/staging/shared-keys.json` and run `staging-secrets.py fill`. To stop
+sharing one, take it off the list and run `fill` again: it clears every staging
+value that is production's own and not listed (also one pasted in by hand). Whoever
 breaks into staging can read those keys, so keep the list short. The script
 refuses the keys that would hand staging control of production (`NEVER_COPY` in
 the script): `JWT_SECRET`, Stripe, R2, the Farcaster mnemonic, bot tokens,
@@ -198,8 +208,9 @@ production's app doing it.
 
 An alert that is not you, the team or the pentesters:
 
-1. Stop it: `apps_enabled = false` and apply (every service to 0), or revoke the
-   certificate the connection log shows.
+1. Stop it: `apps_enabled = false` and apply, which takes every service to 0.
+   Revoking the certificate the connection log shows closes the door, but does
+   not stop code that already runs in a task: do both.
 2. Rotate in production every key `shared-keys.json` lists under `shared`.
 3. Read what happened: the GuardDuty finding, CloudTrail (`/aws/cloudtrail/postiz-staging`),
    the load balancer's connection and access logs, the database's connection log.

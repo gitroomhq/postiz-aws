@@ -119,11 +119,19 @@ def check_account():
     return have
 
 
+def current_version():
+    stages = aws("secretsmanager", "describe-secret", "--secret-id", SECRET_ID, "--query", "VersionIdsToStages")
+    return next((v for v, labels in (stages or {}).items() if "AWSCURRENT" in labels), None)
+
+
 def load_state():
-    out = aws("secretsmanager", "get-secret-value", "--secret-id", SECRET_ID, "--query", "SecretString", quiet_errors=True)
+    out = aws("secretsmanager", "get-secret-value", "--secret-id", SECRET_ID, "--query", "{s:SecretString,v:VersionId}", quiet_errors=True)
     if out is None:
         die(f"no CA yet ({SECRET_ID}): run init first")
-    return json.loads(out)
+    state = json.loads(out["s"])
+    # what this run started from: save_state refuses if someone saved since
+    state["_base_version"] = out["v"]
+    return state
 
 
 def secret_file(state):
@@ -135,11 +143,19 @@ def secret_file(state):
 
 
 def save_state(state):
+    """Write the CA state, unless another run saved since this one loaded it: two
+    runs at once must neither hand out one serial twice nor lose a revocation.
+    (Secrets Manager has no conditional write, so a narrow race remains: one
+    person at a time.)"""
+    base = state.pop("_base_version", None)
+    if base is not None and current_version() != base:
+        die("the CA changed while this ran (someone else issued or revoked): nothing saved, run it again")
     path = secret_file(state)
     try:
-        aws("secretsmanager", "put-secret-value", "--secret-id", SECRET_ID, "--secret-string", f"file://{path}")
+        new = aws("secretsmanager", "put-secret-value", "--secret-id", SECRET_ID, "--secret-string", f"file://{path}")
     finally:
         os.remove(path)
+    state["_base_version"] = new.get("VersionId")
 
 
 class Workdir:
@@ -293,7 +309,7 @@ def cmd_issue(args):
     print(f"password: {password}")
     print("Send the file and the password by different channels. Install: double-click it (macOS,")
     print("Windows), or in Burp: Settings > Network > TLS > Client TLS certificates, host *.getpostiz.com.")
-    print("curl: openssl pkcs12 -in FILE -nodes > me.pem; curl --cert me.pem https://api.getpostiz.com/")
+    print("curl: (umask 077; openssl pkcs12 -in FILE -nodes -out me.pem); curl --cert me.pem https://api.getpostiz.com/")
 
 
 def cmd_revoke(args):

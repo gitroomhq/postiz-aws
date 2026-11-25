@@ -10,9 +10,14 @@
                                    again even where staging has a value (after a rotation there)
     staging-secrets.py missing     the keys still empty, per service (names only)
 
+fill also clears any staging value that is production's own (12 characters or more,
+so not a flag like "true") for a key shared-keys.json does not list: taking a key off
+the list takes production's value out of staging at the next fill, and a production
+credential pasted into staging by hand is caught the same way.
+
 Profiles: STAGING_PROFILE (default postiz-staging) for the staging account, whose id
 STAGING_ACCOUNT_ID must match; PRODUCTION_PROFILE (default postiz) to read production's
-secrets, only when shared-keys.json lists something. Values go from one account to the
+secrets (fill reads them every time, to catch production values that are not listed). Values go from one account to the
 other inside this process and are never printed.
 
 Some production values must never reach staging, whatever shared-keys.json says: the
@@ -153,29 +158,34 @@ def cmd_fill(args):
         die(f"shared-keys.json lists keys no staging service has: {', '.join(unknown)}")
 
     production = {}
-    if copied_names:
-        if aws(production_profile, "sts", "get-caller-identity")["Account"] == staging_account:
-            die(f"PRODUCTION_PROFILE ({production_profile}) points at the staging account")
-        for svc, sources in PRODUCTION_SOURCES.items():
-            merged = {}
-            for source in sources:
-                value = read_secret(production_profile, f"{PRODUCTION_PREFIX}/{source}") or {}
-                for k, v in value.items():
-                    merged.setdefault(k, v)
-            production[svc] = merged
+    if aws(production_profile, "sts", "get-caller-identity")["Account"] == staging_account:
+        die(f"PRODUCTION_PROFILE ({production_profile}) points at the staging account")
+    for svc, sources in PRODUCTION_SOURCES.items():
+        merged = {}
+        for source in sources:
+            value = read_secret(production_profile, f"{PRODUCTION_PREFIX}/{source}") or {}
+            for k, v in value.items():
+                merged.setdefault(k, v)
+        production[svc] = merged
+    production_values = {v for values in production.values() for v in values.values() if len(v) >= 12}
 
     current = {svc: read_secret(staging_profile, f"{STAGING_PREFIX}/{svc}") or {} for svc in keys}
-    jwt = next((current[s].get("JWT_SECRET") for s in current if current[s].get("JWT_SECRET")), None)
+    # one JWT_SECRET for every staging service, never production's
+    jwt = next((current[s]["JWT_SECRET"] for s in current if current[s].get("JWT_SECRET") and current[s]["JWT_SECRET"] not in production_values), None)
     jwt = jwt or "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(64))
 
     for svc, names in keys.items():
         old = current[svc]
-        new, report = {}, {"kept": [], "default": [], "production": [], "generated": [], "empty": [], "dropped": []}
+        new = {}
+        report = {"kept": [], "default": [], "production": [], "generated": [], "empty": [], "dropped": [], "cleared": []}
         for k in names:
             have = old.get(k, "")
             if k in copied_names and (args.recopy or not have) and production[svc].get(k, "") != "":
                 new[k] = production[svc][k]
                 report["production"].append(k)
+            elif have and k not in copied_names and k not in DEFAULTS and have in production_values:
+                new[k] = ""
+                report["cleared"].append(k)
             elif have:
                 new[k] = have
                 report["kept"].append(k)
@@ -196,6 +206,8 @@ def cmd_fill(args):
               + (" (unchanged)" if new == old else ""))
         if report["production"]:
             print(f"  from production: {', '.join(report['production'])}")
+        if report["cleared"]:
+            print(f"  cleared, production's value but not in shared-keys.json: {', '.join(report['cleared'])}")
         if report["dropped"]:
             print(f"  removed, no longer in app-env-keys.json: {', '.join(report['dropped'])}")
     print("Fill the empty ones in the console (Secrets Manager, staging account), see: staging-secrets.py missing")

@@ -32,10 +32,16 @@ resource "aws_sesv2_email_identity" "recipient" {
 }
 
 # In the sandbox SES checks the recipients' identities too, so the sending
-# services may use every identity of this account (only staging's live here).
+# services may use every identity of this account (only staging's live here),
+# but only with a From address of getpostiz.com: never as a tester's address.
 data "aws_iam_policy_document" "ses_send" {
   statement {
     actions   = ["ses:SendEmail"]
     resources = ["arn:aws:ses:${var.region}:${var.aws_account_id}:identity/*"]
+    condition {
+      test     = "StringLike"
+      variable = "ses:FromAddress"
+      values   = ["*@${var.cloudflare_zone_name}"]
+    }
   }
 }
