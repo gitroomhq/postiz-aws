@@ -17,3 +17,8 @@ backend.hcl
 *.local.tfvars
 local.auto.tfvars
 .idea/
+
+# client certificates and keys from scripts/staging-certs.py (issue writes NAME.p12 here)
+*.p12
+*.key
+me.pem
