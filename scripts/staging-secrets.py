@@ -14,6 +14,9 @@
                                    makes its own), the keys shared-keys.json copies from
                                    production, and any value that is production's own
     staging-secrets.py missing     the keys still empty, per service (names only)
+    staging-secrets.py set KEY...  ask for each value (hidden input) and write it to every
+                                   staging service that has the key, e.g. a staging R2 bucket:
+                                   set CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_ACCESS_KEY ...
 
 fill also clears any staging value that is production's own (12 characters or more,
 so not a flag like "true") for a key shared-keys.json does not list: taking a key off
@@ -30,6 +33,7 @@ script refuses them (NEVER_COPY below).
 """
 
 import argparse
+import getpass
 import json
 import os
 import re
@@ -67,6 +71,11 @@ DEFAULTS = {
     "EMAIL_FROM_ADDRESS": "no-reply@getpostiz.com",
     "EMAIL_FROM_NAME": "Postiz Staging",
 }
+
+# Identifiers, not credentials, that staging may legitimately share with production
+# (one Cloudflare account holds both R2 buckets): exempt from the "production's own
+# value" check, though still never copied from production.
+NOT_SECRET = {"CLOUDFLARE_ACCOUNT_ID"}
 
 # Never copied from production. Sharing these would hand staging (and whoever
 # breaks into it) control over production, or mix staging into production's
@@ -199,16 +208,7 @@ def cmd_fill(args):
     if unknown:
         die(f"shared-keys.json lists keys no staging service has: {', '.join(unknown)}")
 
-    production = {}
-    if aws(production_profile, "sts", "get-caller-identity")["Account"] == staging_account:
-        die(f"PRODUCTION_PROFILE ({production_profile}) points at the staging account")
-    for svc, sources in PRODUCTION_SOURCES.items():
-        merged = {}
-        for source in sources:
-            value = read_secret(production_profile, f"{PRODUCTION_PREFIX}/{source}") or {}
-            for k, v in value.items():
-                merged.setdefault(k, v)
-        production[svc] = merged
+    production = read_production(production_profile, staging_account)
     production_values = {v for values in production.values() for v in values.values() if len(v) >= 12}
 
     env = {}
@@ -241,7 +241,7 @@ def cmd_fill(args):
             if k in copied_names and (args.recopy or not have) and production[svc].get(k, "") != "":
                 new[k] = production[svc][k]
                 report["production"].append(k)
-            elif from_env and from_env in production_values:
+            elif from_env and from_env in production_values and k not in NOT_SECRET:
                 # production's own credential in the env file: only through shared-keys.json
                 new[k] = ""
                 report["env_production"].append(k)
@@ -250,7 +250,7 @@ def cmd_fill(args):
                 report["env"].append(k)
                 if re.search(r"localhost|127\.0\.0\.1|0\.0\.0\.0", from_env):
                     report["env_localhost"].append(k)
-            elif have and k not in copied_names and k not in DEFAULTS and have in production_values:
+            elif have and k not in copied_names and k not in DEFAULTS and k not in NOT_SECRET and have in production_values:
                 new[k] = ""
                 report["cleared"].append(k)
             elif have:
@@ -286,6 +286,50 @@ def cmd_fill(args):
     print("Fill the empty ones in the console (Secrets Manager, staging account), see: staging-secrets.py missing")
 
 
+def read_production(production_profile, staging_account):
+    """Each staging service's production values, merged from its production sources."""
+    if aws(production_profile, "sts", "get-caller-identity")["Account"] == staging_account:
+        die(f"PRODUCTION_PROFILE ({production_profile}) points at the staging account")
+    production = {}
+    for svc, sources in PRODUCTION_SOURCES.items():
+        merged = {}
+        for source in sources:
+            value = read_secret(production_profile, f"{PRODUCTION_PREFIX}/{source}") or {}
+            for k, v in value.items():
+                merged.setdefault(k, v)
+        production[svc] = merged
+    return production
+
+
+def cmd_set(args):
+    staging_profile = os.environ.get("STAGING_PROFILE", "postiz-staging")
+    production_profile = os.environ.get("PRODUCTION_PROFILE", "postiz")
+    staging_account = check_staging(staging_profile)
+    keys = load_json("app-env-keys.json")
+    shared = set(load_json("shared-keys.json").get("shared", []))
+    every_key = {k for v in keys.values() for k in v}
+    unknown = [k for k in args.keys if k not in every_key]
+    if unknown:
+        die(f"no staging service has: {', '.join(unknown)}")
+    values = {}
+    for k in dict.fromkeys(args.keys):
+        values[k] = getpass.getpass(f"{k} (hidden): ").strip()
+    production = read_production(production_profile, staging_account)
+    production_values = {v for vals in production.values() for v in vals.values() if len(v) >= 12}
+    for k, v in values.items():
+        if v and v in production_values and k not in shared and k not in NOT_SECRET:
+            die(f"{k}: that is production's own value; nothing written (to share it on purpose, list it under shared in shared-keys.json)")
+    for svc, names in keys.items():
+        mine = [k for k in values if k in names]
+        if not mine:
+            continue
+        current = read_secret(staging_profile, f"{STAGING_PREFIX}/{svc}") or {}
+        current.update({k: values[k] for k in mine})
+        write_secret(staging_profile, f"{STAGING_PREFIX}/{svc}", current)
+        print(f"{STAGING_PREFIX}/{svc}: set {', '.join(mine)}")
+    print("The services read their secrets when they start: deploy (or force a new deployment) to use them.")
+
+
 def cmd_missing(_args):
     staging_profile = os.environ.get("STAGING_PROFILE", "postiz-staging")
     check_staging(staging_profile)
@@ -305,6 +349,9 @@ def main():
     f.add_argument("--from-env", metavar="FILE")
     f.set_defaults(func=cmd_fill)
     sub.add_parser("missing").set_defaults(func=cmd_missing)
+    st = sub.add_parser("set")
+    st.add_argument("keys", nargs="+", metavar="KEY")
+    st.set_defaults(func=cmd_set)
     args = p.parse_args()
     args.func(args)
 

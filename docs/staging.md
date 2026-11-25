@@ -141,7 +141,13 @@ Once, in this order. Steps marked (mgmt) need the management account
     Stripe test-mode keys, a staging R2 bucket and its keys
     (`CLOUDFLARE_*`), staging API keys with spending caps (OpenAI, FAL, ...),
     the providers' test apps. `scripts/staging-secrets.py missing` lists what is
-    still empty. The frontend's `NEXT_PUBLIC_*` values are compiled into its image,
+    still empty. `scripts/staging-secrets.py set KEY...` asks for
+    values with hidden input and writes them to every service that has the key.
+    A staging R2 bucket (uploads go from the browser straight to R2): create
+    `postiz-staging`, connect `uploads.getpostiz.com` as its public domain, add a
+    CORS rule for `https://platform.getpostiz.com` (GET, PUT, HEAD, any header,
+    expose ETag), create an R2 token for that bucket only (Object Read & Write), then
+    `set CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_ACCESS_KEY CLOUDFLARE_SECRET_ACCESS_KEY CLOUDFLARE_BUCKETNAME CLOUDFLARE_BUCKET_URL`. The frontend's `NEXT_PUBLIC_*` values are compiled into its image,
     so set them before the first build.
 
 11. **Images**: deploy-staging with `build_only` (branch `main`).
