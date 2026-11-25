@@ -8,7 +8,15 @@
                                    fill in the console (ECS needs every key to exist)
     staging-secrets.py fill --recopy   the same, and copy shared-keys.json's keys from production
                                    again even where staging has a value (after a rotation there)
+    staging-secrets.py fill --from-env FILE   take the values from a local .env (your dev keys)
+                                   for every key it sets, except: staging's own defaults (URLs,
+                                   NODE_ENV, NODE_OPTIONS, the From address), JWT_SECRET (staging
+                                   makes its own), the keys shared-keys.json copies from
+                                   production, and any value that is production's own
     staging-secrets.py missing     the keys still empty, per service (names only)
+    staging-secrets.py set KEY...  ask for each value (hidden input) and write it to every
+                                   staging service that has the key, e.g. a staging R2 bucket:
+                                   set CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_ACCESS_KEY ...
 
 fill also clears any staging value that is production's own (12 characters or more,
 so not a flag like "true") for a key shared-keys.json does not list: taking a key off
@@ -25,9 +33,11 @@ script refuses them (NEVER_COPY below).
 """
 
 import argparse
+import getpass
 import json
 import os
 import re
+
 import secrets
 import string
 import subprocess
@@ -61,6 +71,11 @@ DEFAULTS = {
     "EMAIL_FROM_ADDRESS": "no-reply@getpostiz.com",
     "EMAIL_FROM_NAME": "Postiz Staging",
 }
+
+# Identifiers, not credentials, that staging may legitimately share with production
+# (one Cloudflare account holds both R2 buckets): exempt from the "production's own
+# value" check, though still never copied from production.
+NOT_SECRET = {"CLOUDFLARE_ACCOUNT_ID"}
 
 # Never copied from production. Sharing these would hand staging (and whoever
 # breaks into it) control over production, or mix staging into production's
@@ -127,6 +142,42 @@ def write_secret(profile, secret_id, value):
         os.remove(path)
 
 
+ENV_LINE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
+ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+
+def parse_env_file(path):
+    """KEY=value lines of a dotenv file: export prefixes, comments, single or double
+    quotes (a quoted value may span lines; double quotes take \\n escapes)."""
+    with open(path, encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    values, i = {}, 0
+    while i < len(lines):
+        m = ENV_LINE.match(lines[i])
+        i += 1
+        if not m:
+            continue
+        name, rest = m.group(1), m.group(2)
+        if rest[:1] in ('"', "'", "`"):
+            quote, body = rest[0], rest[1:]
+            while True:
+                end = body.find(quote)
+                while quote == '"' and end > 0 and body[end - 1] == "\\":
+                    end = body.find(quote, end + 1)
+                if end >= 0 or i >= len(lines):
+                    break
+                body += "\n" + lines[i]
+                i += 1
+            value = body[:end] if end >= 0 else body
+            if quote == '"':
+                value = (value.replace("\\n", "\n").replace("\\r", "\r").replace("\\t", "\t")
+                         .replace('\\"', '"').replace("\\\\", "\\"))
+        else:
+            value = re.split(r"\s+#", rest, maxsplit=1)[0].strip()
+        values[name] = value
+    return values
+
+
 def load_json(name):
     with open(os.path.join(STAGING_DIR, name)) as f:
         return json.load(f)
@@ -157,17 +208,22 @@ def cmd_fill(args):
     if unknown:
         die(f"shared-keys.json lists keys no staging service has: {', '.join(unknown)}")
 
-    production = {}
-    if aws(production_profile, "sts", "get-caller-identity")["Account"] == staging_account:
-        die(f"PRODUCTION_PROFILE ({production_profile}) points at the staging account")
-    for svc, sources in PRODUCTION_SOURCES.items():
-        merged = {}
-        for source in sources:
-            value = read_secret(production_profile, f"{PRODUCTION_PREFIX}/{source}") or {}
-            for k, v in value.items():
-                merged.setdefault(k, v)
-        production[svc] = merged
+    production = read_production(production_profile, staging_account)
     production_values = {v for values in production.values() for v in values.values() if len(v) >= 12}
+
+    env = {}
+    if args.from_env:
+        env = {k: v for k, v in parse_env_file(args.from_env).items() if v != ""}
+        every_key = {k for v in keys.values() for k in v}
+        managed = {"DATABASE_URL", "REDIS_URL", "EMAIL_PROVIDER", "ENCRYPTION_PROVIDER", "ENCRYPTION_KMS_REGION",
+                   "ENCRYPTION_KMS_DATA_KEY", "TEMPORAL_ADDRESS", "PORT"}
+        extra = sorted(k for k in env if k not in every_key and k not in managed and ENV_NAME.match(k))
+        odd = sum(1 for k in env if not ENV_NAME.match(k))
+        print(f"{args.from_env}: {len(env)} values; {len(set(env) & every_key)} for staging's keys")
+        if extra:
+            print(f"  not used, staging has no such key: {', '.join(extra)}")
+        if odd:
+            print(f"  {odd} line(s) that do not look like a setting were skipped (names not shown)")
 
     current = {svc: read_secret(staging_profile, f"{STAGING_PREFIX}/{svc}") or {} for svc in keys}
     # one JWT_SECRET for every staging service, never production's
@@ -177,13 +233,24 @@ def cmd_fill(args):
     for svc, names in keys.items():
         old = current[svc]
         new = {}
-        report = {"kept": [], "default": [], "production": [], "generated": [], "empty": [], "dropped": [], "cleared": []}
+        report = {"kept": [], "default": [], "production": [], "generated": [], "empty": [], "dropped": [], "cleared": [],
+                  "env": [], "env_production": [], "env_localhost": []}
         for k in names:
             have = old.get(k, "")
+            from_env = env.get(k, "") if k not in DEFAULTS and k != "JWT_SECRET" and k not in copied_names else ""
             if k in copied_names and (args.recopy or not have) and production[svc].get(k, "") != "":
                 new[k] = production[svc][k]
                 report["production"].append(k)
-            elif have and k not in copied_names and k not in DEFAULTS and have in production_values:
+            elif from_env and from_env in production_values and k not in NOT_SECRET:
+                # production's own credential in the env file: only through shared-keys.json
+                new[k] = ""
+                report["env_production"].append(k)
+            elif from_env:
+                new[k] = from_env
+                report["env"].append(k)
+                if re.search(r"localhost|127\.0\.0\.1|0\.0\.0\.0", from_env):
+                    report["env_localhost"].append(k)
+            elif have and k not in copied_names and k not in DEFAULTS and k not in NOT_SECRET and have in production_values:
                 new[k] = ""
                 report["cleared"].append(k)
             elif have:
@@ -201,9 +268,15 @@ def cmd_fill(args):
         report["dropped"] = sorted(set(old) - set(names))
         if new != old:
             write_secret(staging_profile, f"{STAGING_PREFIX}/{svc}", new)
-        print(f"{STAGING_PREFIX}/{svc}: {len(report['kept'])} kept, {len(report['default'])} staging defaults, "
-              f"{len(report['generated'])} generated, {len(report['production'])} from production, {len(report['empty'])} empty"
+        print(f"{STAGING_PREFIX}/{svc}: {len(report['env'])} from your env, {len(report['kept'])} kept, "
+              f"{len(report['default'])} staging defaults, {len(report['generated'])} generated, "
+              f"{len(report['production'])} from production, {len(report['empty']) + len(report['env_production'])} empty"
               + (" (unchanged)" if new == old else ""))
+        if report["env_production"]:
+            print(f"  left empty, your env holds production's value: {', '.join(report['env_production'])}"
+                  " (to share it on purpose, list it under shared in shared-keys.json)")
+        if report["env_localhost"]:
+            print(f"  from your env but pointing at this machine, fix in the console: {', '.join(report['env_localhost'])}")
         if report["production"]:
             print(f"  from production: {', '.join(report['production'])}")
         if report["cleared"]:
@@ -211,6 +284,50 @@ def cmd_fill(args):
         if report["dropped"]:
             print(f"  removed, no longer in app-env-keys.json: {', '.join(report['dropped'])}")
     print("Fill the empty ones in the console (Secrets Manager, staging account), see: staging-secrets.py missing")
+
+
+def read_production(production_profile, staging_account):
+    """Each staging service's production values, merged from its production sources."""
+    if aws(production_profile, "sts", "get-caller-identity")["Account"] == staging_account:
+        die(f"PRODUCTION_PROFILE ({production_profile}) points at the staging account")
+    production = {}
+    for svc, sources in PRODUCTION_SOURCES.items():
+        merged = {}
+        for source in sources:
+            value = read_secret(production_profile, f"{PRODUCTION_PREFIX}/{source}") or {}
+            for k, v in value.items():
+                merged.setdefault(k, v)
+        production[svc] = merged
+    return production
+
+
+def cmd_set(args):
+    staging_profile = os.environ.get("STAGING_PROFILE", "postiz-staging")
+    production_profile = os.environ.get("PRODUCTION_PROFILE", "postiz")
+    staging_account = check_staging(staging_profile)
+    keys = load_json("app-env-keys.json")
+    shared = set(load_json("shared-keys.json").get("shared", []))
+    every_key = {k for v in keys.values() for k in v}
+    unknown = [k for k in args.keys if k not in every_key]
+    if unknown:
+        die(f"no staging service has: {', '.join(unknown)}")
+    values = {}
+    for k in dict.fromkeys(args.keys):
+        values[k] = getpass.getpass(f"{k} (hidden): ").strip()
+    production = read_production(production_profile, staging_account)
+    production_values = {v for vals in production.values() for v in vals.values() if len(v) >= 12}
+    for k, v in values.items():
+        if v and v in production_values and k not in shared and k not in NOT_SECRET:
+            die(f"{k}: that is production's own value; nothing written (to share it on purpose, list it under shared in shared-keys.json)")
+    for svc, names in keys.items():
+        mine = [k for k in values if k in names]
+        if not mine:
+            continue
+        current = read_secret(staging_profile, f"{STAGING_PREFIX}/{svc}") or {}
+        current.update({k: values[k] for k in mine})
+        write_secret(staging_profile, f"{STAGING_PREFIX}/{svc}", current)
+        print(f"{STAGING_PREFIX}/{svc}: set {', '.join(mine)}")
+    print("The services read their secrets when they start: deploy (or force a new deployment) to use them.")
 
 
 def cmd_missing(_args):
@@ -229,8 +346,12 @@ def main():
     sub = p.add_subparsers(dest="command", required=True)
     f = sub.add_parser("fill")
     f.add_argument("--recopy", action="store_true")
+    f.add_argument("--from-env", metavar="FILE")
     f.set_defaults(func=cmd_fill)
     sub.add_parser("missing").set_defaults(func=cmd_missing)
+    st = sub.add_parser("set")
+    st.add_argument("keys", nargs="+", metavar="KEY")
+    st.set_defaults(func=cmd_set)
     args = p.parse_args()
     args.func(args)
 
