@@ -7,8 +7,8 @@ github_repository = "gitroomhq/postiz-aws"
 # not production's 10.20.0.0/16, in case the two are ever peered or compared in logs
 vpc_cidr = "10.30.0.0/16"
 
-# Off until the first images are built (docs/staging.md, first deploy)
-apps_enabled = false
+# On since the first images were built (docs/staging.md, step 12)
+apps_enabled = true
 
 # getpostiz.com: its own registrable domain, so staging's login cookie
 # (.getpostiz.com) is never sent to production and production's never to staging

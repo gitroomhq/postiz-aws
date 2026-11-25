@@ -54,6 +54,11 @@ mock_provider "cloudflare" {
 run "new_environment" {
   command = plan
 
+  # terraform.tfvars has the apps on now; a new environment starts with them off
+  variables {
+    apps_enabled = false
+  }
+
   assert {
     condition     = length(data.aws_ecr_image.app) == 0 && alltrue([for k, m in module.postiz : m.service_name != null])
     error_message = "with the apps off (a new environment), the plan needs no image and still plans every service"
