@@ -91,7 +91,7 @@ resource "aws_db_instance" "this" {
   auto_minor_version_upgrade   = true
   allow_major_version_upgrade  = false
   apply_immediately            = false
-  performance_insights_enabled = true
+  performance_insights_enabled = var.performance_insights
 
   enabled_cloudwatch_logs_exports = var.cloudwatch_logs_exports
 
@@ -143,14 +143,14 @@ resource "aws_cloudwatch_metric_alarm" "cpu" {
 
 resource "aws_cloudwatch_metric_alarm" "storage" {
   alarm_name          = "${var.identifier}-free-storage-low"
-  alarm_description   = "RDS ${var.identifier} has less than 10 GiB free (storage autoscaling may be maxed out)"
+  alarm_description   = "RDS ${var.identifier} has less than ${var.free_storage_alarm_gib} GiB free (storage autoscaling may be maxed out)"
   namespace           = "AWS/RDS"
   metric_name         = "FreeStorageSpace"
   dimensions          = { DBInstanceIdentifier = aws_db_instance.this.identifier }
   statistic           = "Minimum"
   period              = 300
   evaluation_periods  = 2
-  threshold           = 10 * 1024 * 1024 * 1024
+  threshold           = var.free_storage_alarm_gib * 1024 * 1024 * 1024
   comparison_operator = "LessThanThreshold"
   alarm_actions       = [var.alarm_topic_arn]
   ok_actions          = [var.alarm_topic_arn]
@@ -158,14 +158,14 @@ resource "aws_cloudwatch_metric_alarm" "storage" {
 
 resource "aws_cloudwatch_metric_alarm" "memory" {
   alarm_name          = "${var.identifier}-freeable-memory-low"
-  alarm_description   = "RDS ${var.identifier} freeable memory under 512 MiB"
+  alarm_description   = "RDS ${var.identifier} freeable memory under ${var.freeable_memory_alarm_mib} MiB"
   namespace           = "AWS/RDS"
   metric_name         = "FreeableMemory"
   dimensions          = { DBInstanceIdentifier = aws_db_instance.this.identifier }
   statistic           = "Minimum"
   period              = 300
   evaluation_periods  = 3
-  threshold           = 512 * 1024 * 1024
+  threshold           = var.freeable_memory_alarm_mib * 1024 * 1024
   comparison_operator = "LessThanThreshold"
   alarm_actions       = [var.alarm_topic_arn]
   ok_actions          = [var.alarm_topic_arn]

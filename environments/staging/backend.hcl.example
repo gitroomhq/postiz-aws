@@ -1,0 +1,3 @@
+# cp backend.hcl.example backend.hcl, then put the staging account id in:
+# terraform -chdir=environments/staging init -backend-config=backend.hcl
+bucket = "postiz-terraform-state-<staging account id>"

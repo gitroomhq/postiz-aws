@@ -276,6 +276,7 @@ If the gate itself is broken, admin credentials still work: apply locally
 
 ```
 bootstrap/                 state bucket, GitHub OIDC, plan/apply/read-only roles, the deploy gate (applied by hand, never by CI)
+  staging/                 the same first step for the staging account, and the organization policy on it
 modules/
   network/                 VPC, public + private subnets, no NAT
   ecs-cluster/             ECS cluster, Graviton ASG, capacity provider
@@ -284,11 +285,14 @@ modules/
   guardduty/               GuardDuty in one Region, findings sent on to the Region with the alerts
 environments/production/   everything else; app-env-keys.json = env var names per service
   tests/                   offline plan test with mocked providers
+environments/staging/      a small copy on Fargate Spot in its own account, behind client certificates (docs/staging.md)
 docker/                    postiz-app.Dockerfile (one image per app), postiz.Dockerfile (all-in-one, before the split), ops.Dockerfile (migration toolbox)
-scripts/                   migration, env copy, Temporal UI tunnel and CLI, read-only psql, test browser, ECR retag, deploy gate (deploy-gate.sh for you, gate-ci.sh for the workflows)
+scripts/                   migration, env copy, Temporal UI tunnel and CLI, read-only psql, test browser, ECR retag, deploy gate (deploy-gate.sh for you, gate-ci.sh for the workflows), staging-* (client certificates, secrets, Temporal UI)
 .claude/skills/temporal/   Claude Code skill: production Temporal through scripts/temporal-cli.sh
-.github/workflows/         terraform (plan on PR, apply by hand), deploy-postiz, deploy-games, ops-image: all change production only through the deploy gate
+.github/workflows/         terraform (plan on PR, apply by hand), deploy-postiz, deploy-games, ops-image: all change production only through the deploy gate;
+                           terraform-staging and deploy-staging: the staging account only, no gate
 docs/migration-runbook.md
+docs/staging.md            staging: setup, certificates, deploys, pentests
 ```
 
 ## Day to day

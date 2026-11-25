@@ -22,6 +22,12 @@ variable "launch_type" {
   }
 }
 
+variable "fargate_spot" {
+  description = "fargate launch type only: run on FARGATE_SPOT, at a discount, stopped with two minutes' notice when AWS needs the capacity back (the service starts a new task when it can)."
+  type        = bool
+  default     = false
+}
+
 variable "capacity_provider_name" {
   description = "EC2 capacity provider, ec2 launch type only."
   type        = string
