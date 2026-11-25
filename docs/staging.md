@@ -134,7 +134,10 @@ Once, in this order. Steps marked (mgmt) need the management account
 
 10. **Secrets**: `scripts/staging-secrets.py fill` writes every key with staging's
     URLs, a new `JWT_SECRET`, the settings `shared-keys.json` copies from
-    production, and "" for the rest. Then fill in the console what staging needs:
+    production, and "" for the rest. With `--from-env ~/path/to/.env` it first
+    takes your local dev values for every key the file sets (not the URLs,
+    `NODE_ENV`, `NODE_OPTIONS`, the From address or `JWT_SECRET`), and leaves
+    empty any value that is production's own. Then fill in the console what staging needs:
     Stripe test-mode keys, a staging R2 bucket and its keys
     (`CLOUDFLARE_*`), staging API keys with spending caps (OpenAI, FAL, ...),
     the providers' test apps. `scripts/staging-secrets.py missing` lists what is
