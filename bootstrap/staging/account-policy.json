@@ -1,0 +1,69 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "OnlyUsEast2",
+      "Effect": "Deny",
+      "NotAction": [
+        "account:*", "aws-portal:*", "billing:*", "budgets:*", "ce:*", "cloudfront:*", "consolidatedbilling:*",
+        "cur:*", "ec2:DescribeRegions", "freetier:*", "health:*", "iam:*", "invoicing:*", "organizations:*",
+        "payments:*", "pricing:*", "route53:*", "route53domains:*", "s3:GetAccountPublicAccessBlock",
+        "s3:ListAllMyBuckets", "s3:PutAccountPublicAccessBlock", "signin:*", "sso:*", "sts:*", "support:*",
+        "tag:GetResources", "tax:*", "trustedadvisor:*"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringNotEquals": { "aws:RequestedRegion": ["us-east-2"] }
+      }
+    },
+    {
+      "Sid": "NoMachines",
+      "Effect": "Deny",
+      "Action": [
+        "ec2:RunInstances", "ec2:RequestSpotInstances", "ec2:RequestSpotFleet", "ec2:CreateFleet",
+        "lightsail:CreateInstances", "sagemaker:CreateNotebookInstance", "batch:CreateComputeEnvironment"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "NoUsersOrKeys",
+      "Effect": "Deny",
+      "Action": ["iam:CreateUser", "iam:CreateAccessKey", "iam:CreateLoginProfile", "iam:UpdateLoginProfile"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "DetectionStaysOn",
+      "Effect": "Deny",
+      "Action": [
+        "cloudtrail:StopLogging", "cloudtrail:DeleteTrail", "cloudtrail:UpdateTrail", "cloudtrail:PutEventSelectors",
+        "guardduty:DeleteDetector", "guardduty:UpdateDetector", "guardduty:CreateFilter", "guardduty:UpdateFilter",
+        "guardduty:CreateIPSet", "guardduty:UpdateIPSet", "guardduty:UpdateMalwareScanSettings"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "ArnNotLike": {
+          "aws:PrincipalArn": [
+            "arn:aws:iam::*:role/postiz-staging-github-terraform-apply",
+            "arn:aws:iam::*:role/AccountFullAccessRole",
+            "arn:aws:iam::*:role/OrganizationAccountAccessRole"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "NoRootUser",
+      "Effect": "Deny",
+      "Action": "*",
+      "Resource": "*",
+      "Condition": {
+        "ArnLike": { "aws:PrincipalArn": ["arn:aws:iam::*:root"] }
+      }
+    },
+    {
+      "Sid": "StaysInTheOrganization",
+      "Effect": "Deny",
+      "Action": ["organizations:LeaveOrganization"],
+      "Resource": "*"
+    }
+  ]
+}

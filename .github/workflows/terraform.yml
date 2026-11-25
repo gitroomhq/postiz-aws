@@ -11,7 +11,8 @@ name: terraform
 on:
   pull_request:
     paths:
-      - "environments/**"
+      # environments/staging has its own workflow (terraform-staging.yml)
+      - "environments/production/**"
       - "modules/**"
       - ".github/workflows/terraform.yml"
   workflow_dispatch:

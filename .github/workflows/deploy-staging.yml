@@ -1,0 +1,294 @@
+name: deploy-staging
+
+# postiz-app on staging (environments/staging), from any branch of postiz-app:
+#   build    the three app images and the db push image of that commit, with
+#            production's Dockerfile; an image already pushed for the commit is reused
+#   release  (init_database) the db init task: roles and Temporal's databases
+#            prisma db push as a one-off task, then <app>-staging moves to the new
+#            images and backend, frontend and worker restart
+#
+# Started by hand. The jobs run in the "staging" GitHub environment, which the
+# repository settings limit to main, so only this file as it is on main can
+# assume the deploy role. No code from the authenticator, unlike production:
+# that role reaches only the staging account (environments/staging/deploy.tf).
+#
+# Only branches of postiz-app itself: not tags, not bare commits, not the pull
+# request refs that forks can create.
+
+run-name: ${{ format('staging {0} by {1}', github.event.inputs.ref, github.actor) }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: branch of postiz-app
+        required: true
+        default: main
+      init_database:
+        description: create the database roles and Temporal's databases first (first deploy, after a password rotation)
+        type: boolean
+        default: false
+      accept_data_loss:
+        description: let prisma db push drop columns or tables (moving between branches with different schemas)
+        type: boolean
+        default: false
+      skip_db_push:
+        description: roll out without prisma db push
+        type: boolean
+        default: false
+      build_only:
+        description: push the images and move <app>-staging, no database step and no rollout (first deploy, before apps_enabled)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: false
+
+env:
+  # Not used by the steps: referencing the secret makes the public logs print ***
+  # for the account id (ECR registry, task ARNs).
+  AWS_ACCOUNT_ID: ${{ secrets.STAGING_AWS_ACCOUNT_ID }}
+  DEPLOY_ROLE: ${{ vars.STAGING_DEPLOY_ROLE_ARN }}
+  APP_REPOSITORY: ${{ vars.APP_REPOSITORY || 'gitroomhq/postiz-app' }}
+  AWS_REGION: us-east-2
+  CLUSTER: postiz-staging
+  REPOSITORY: postiz-app
+  SERVICES: backend frontend worker
+
+jobs:
+  plan:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: staging
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - name: commit
+        id: commit
+        env:
+          APP_TOKEN: ${{ secrets.APP_REPO_TOKEN || github.token }}
+          REF: ${{ github.event.inputs.ref }}
+        run: |
+          api() { curl -fsSL -H "Authorization: Bearer $APP_TOKEN" -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/$APP_REPOSITORY/$1"; }
+          if ! [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]]; then echo "unexpected branch name '$REF'" >&2; exit 1; fi
+          branch=$(api "branches/$(jq -rn --arg b "$REF" '$b | @uri')" || true)
+          sha=$(jq -r '.commit.sha // empty' <<< "$branch")
+          if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then echo "no branch '$REF' in $APP_REPOSITORY" >&2; exit 1; fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          jq -r --arg repo "$APP_REPOSITORY" --arg ref "$REF" --arg by "$GITHUB_ACTOR" '
+            "### staging: `\($ref)`",
+            "- commit [`\(.commit.sha[0:12])`](https://github.com/\($repo)/commit/\(.commit.sha)): \(.commit.commit.message | split("\n") | first)",
+            "- started by \($by)"
+          ' <<< "$branch" | tee -a "$GITHUB_STEP_SUMMARY" || true
+
+  build:
+    needs: plan
+    strategy:
+      fail-fast: true
+      matrix:
+        app: [frontend, backend, orchestrator, migrate]
+    name: build ${{ matrix.app }}
+    # arm64: the Fargate tasks are Graviton
+    runs-on: ${{ vars.BUILD_RUNNER || 'ubuntu-24.04-arm' }}
+    environment: staging
+    timeout-minutes: 60
+    env:
+      TAG: ${{ matrix.app }}-${{ needs.plan.outputs.sha }}
+    steps:
+      - name: checkout infra
+        uses: actions/checkout@v4
+        with:
+          path: infra
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.DEPLOY_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: ecr login
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # a branch deployed again without new commits reuses its images
+      - name: existing image
+        id: existing
+        run: |
+          if aws ecr describe-images --repository-name "$REPOSITORY" --image-ids imageTag="$TAG" >/dev/null 2>&1; then
+            echo "$REPOSITORY:$TAG exists, not rebuilding"
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: checkout postiz-app
+        if: steps.existing.outputs.found != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.APP_REPOSITORY }}
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ secrets.APP_REPO_TOKEN || github.token }}
+          path: app
+          # the build context is this directory: no token in its .git/config
+          persist-credentials: false
+
+      - name: frontend build values
+        if: steps.existing.outputs.found != 'true' && matrix.app == 'frontend'
+        # only NEXT_PUBLIC_* keys of staging's own frontend secret, shell-quoted, as a BuildKit secret
+        # a failed read must fail the build, not ship a frontend without its values
+        run: |
+          set -o pipefail
+          aws secretsmanager get-secret-value --secret-id postiz/staging/frontend \
+            --query SecretString --output text \
+            | jq -r 'to_entries[] | select(.key | startswith("NEXT_PUBLIC_")) | "\(.key)=\(.value | @sh)"' \
+            > "$RUNNER_TEMP/frontend.env"
+          count=$(wc -l < "$RUNNER_TEMP/frontend.env")
+          echo "$count NEXT_PUBLIC_* values"
+          [ "$count" -gt 0 ] || { echo "postiz/staging/frontend has no NEXT_PUBLIC_* keys (scripts/staging-secrets.py fill)" >&2; exit 1; }
+
+      - uses: docker/setup-buildx-action@v3
+        if: steps.existing.outputs.found != 'true'
+
+      - name: build and push
+        if: steps.existing.outputs.found != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: app
+          file: infra/docker/postiz-app.Dockerfile
+          target: ${{ matrix.app }}
+          platforms: linux/arm64
+          push: true
+          provenance: false
+          tags: ${{ steps.ecr.outputs.registry }}/${{ env.REPOSITORY }}:${{ env.TAG }}
+          secret-files: ${{ matrix.app == 'frontend' && format('frontend_env={0}/frontend.env', runner.temp) || '' }}
+
+  # The toolbox the db init task runs (docker/ops.Dockerfile, with this repository's scripts/)
+  ops-image:
+    needs: plan
+    if: github.event.inputs.init_database == 'true' && github.event.inputs.build_only != 'true'
+    runs-on: ${{ vars.BUILD_RUNNER || 'ubuntu-24.04-arm' }}
+    environment: staging
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.DEPLOY_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: ecr login
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/ops.Dockerfile
+          platforms: linux/arm64
+          push: true
+          provenance: false
+          tags: ${{ steps.ecr.outputs.registry }}/postiz-ops:latest
+
+  release:
+    needs: [plan, build, ops-image]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.build.result == 'success' && (needs.ops-image.result == 'success' || needs.ops-image.result == 'skipped') }}
+    runs-on: ubuntu-24.04
+    environment: staging
+    timeout-minutes: 60
+    env:
+      SHA: ${{ needs.plan.outputs.sha }}
+    steps:
+      - name: checkout infra
+        uses: actions/checkout@v4
+        with:
+          path: infra
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.DEPLOY_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # One-off tasks on regular Fargate, in the backend service's subnets and security group
+      - name: one-off task helper
+        if: ${{ github.event.inputs.build_only != 'true' }}
+        run: |
+          network=$(aws ecs describe-services --cluster "$CLUSTER" --services backend \
+            --query 'services[0].networkConfiguration' --output json)
+          cat > "$RUNNER_TEMP/one-off.sh" <<'SH'
+          # one_off <task definition family> [container overrides JSON]: run to completion, print its log, fail on a non-zero exit
+          one_off() {
+            local family=$1 overrides=${2:-'{}'}
+            while [ "$(aws ecs list-tasks --cluster "$CLUSTER" --family "$family" --desired-status RUNNING \
+                --query 'length(taskArns)' --output text)" != "0" ]; do
+              echo "an earlier $family task is still running, waiting"
+              sleep 15
+            done
+            local task
+            task=$(aws ecs run-task --cluster "$CLUSTER" --task-definition "$family" \
+              --capacity-provider-strategy capacityProvider=FARGATE,weight=1 \
+              --network-configuration "$NETWORK" --overrides "$overrides" \
+              --started-by "deploy-$SHA" --query 'tasks[0].taskArn' --output text)
+            echo "task $task"
+            for _ in $(seq 1 4); do
+              aws ecs wait tasks-stopped --cluster "$CLUSTER" --tasks "$task" && break
+            done
+            local name=${family#"$CLUSTER"-}
+            aws logs get-log-events --log-group-name "/ecs/$CLUSTER/$name" \
+              --log-stream-name "$name/$name/${task##*/}" --query 'events[].message' --output text | tr '\t' '\n' | tail -50 || true
+            local code reason
+            # by name: GuardDuty adds its agent to the task as another container
+            code=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$task" \
+              --query "tasks[0].containers[?name=='$name'].exitCode | [0]" --output text)
+            reason=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$task" --query 'tasks[0].stoppedReason' --output text)
+            echo "exit code: $code ($reason)"
+            [ "$code" = "0" ]
+          }
+          SH
+          echo "NETWORK=$(jq -c . <<< "$network")" >> "$GITHUB_ENV"
+
+      - name: database roles and Temporal's databases
+        if: ${{ github.event.inputs.build_only != 'true' && github.event.inputs.init_database == 'true' }}
+        run: |
+          . "$RUNNER_TEMP/one-off.sh"
+          one_off "$CLUSTER-db-init"
+
+      - name: prisma db push
+        if: ${{ github.event.inputs.build_only != 'true' && github.event.inputs.skip_db_push != 'true' }}
+        env:
+          ACCEPT_DATA_LOSS: ${{ github.event.inputs.accept_data_loss }}
+        run: |
+          . "$RUNNER_TEMP/one-off.sh"
+          infra/scripts/ecr-retag.sh "$REPOSITORY" "migrate-$SHA" migrate
+          overrides='{}'
+          if [ "$ACCEPT_DATA_LOSS" = true ]; then
+            overrides='{"containerOverrides":[{"name":"db-push","command":["prisma","db","push","--schema","./schema.prisma","--skip-generate","--accept-data-loss"]}]}'
+          fi
+          one_off "$CLUSTER-db-push" "$overrides"
+          infra/scripts/ecr-retag.sh "$REPOSITORY" "migrate-$SHA" migrate-staging
+
+      - name: promote to staging
+        run: |
+          for app in frontend backend orchestrator; do
+            infra/scripts/ecr-retag.sh "$REPOSITORY" "$app-$SHA" "$app-staging"
+          done
+
+      - name: roll services
+        if: ${{ github.event.inputs.build_only != 'true' }}
+        run: |
+          for s in $SERVICES; do
+            aws ecs update-service --cluster "$CLUSTER" --service "$s" --force-new-deployment --query 'service.serviceName' --output text
+          done
+          for _ in $(seq 1 3); do
+            aws ecs wait services-stable --cluster "$CLUSTER" --services $SERVICES && exit 0
+          done
+          echo "services not stable after 30 minutes, check the ECS console (the circuit breaker rolls back failed deployments)"
+          exit 1

@@ -5,7 +5,8 @@
 #              host's public IP (internet-facing app containers).
 # awsvpc mode: own ENI in a private subnet, ALB targets are IPs, discoverable
 #              through Cloud Map A records (internal-only containers).
-# fargate:     awsvpc on FARGATE instead of the EC2 hosts (small internal apps).
+# fargate:     awsvpc on FARGATE instead of the EC2 hosts (small internal apps),
+#              or on FARGATE_SPOT with fargate_spot (staging).
 #              The VPC has no NAT gateway, so a task that calls the internet runs
 #              in a public subnet with assign_public_ip = true, inbound closed by
 #              its security group.
@@ -155,6 +156,10 @@ resource "aws_ecs_task_definition" "this" {
       condition     = local.fargate || var.capacity_provider_name != null
       error_message = "The ec2 launch type needs capacity_provider_name."
     }
+    precondition {
+      condition     = local.fargate || !var.fargate_spot
+      error_message = "fargate_spot needs launch_type = \"fargate\"."
+    }
   }
 
   runtime_platform {
@@ -209,7 +214,7 @@ resource "aws_ecs_service" "this" {
   health_check_grace_period_seconds  = var.target_group_arn == null ? null : var.health_check_grace_period
 
   capacity_provider_strategy {
-    capacity_provider = local.fargate ? "FARGATE" : var.capacity_provider_name
+    capacity_provider = local.fargate ? (var.fargate_spot ? "FARGATE_SPOT" : "FARGATE") : var.capacity_provider_name
     weight            = 1
   }
 

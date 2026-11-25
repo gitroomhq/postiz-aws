@@ -1,0 +1,29 @@
+{
+  "_comment": [
+    "Values scripts/staging-secrets.py copies from production into staging's secrets. Everything else is staging's own.",
+    "settings: configuration, not credentials, so staging behaves like production.",
+    "shared: production credentials staging uses on purpose, for providers that allow only one app. Whoever breaks into staging can read these: keep the list short, and rotate them in production if a staging alert says someone got in (docs/staging.md).",
+    "The script refuses any key on its never-copy list (JWT_SECRET, Stripe, R2, the Farcaster mnemonic, bot tokens, billing and webhook secrets, analytics)."
+  ],
+  "settings": [
+    "API_LIMIT",
+    "CLOUDFLARE_REGION",
+    "DCR_VERIFIED_DOMAINS",
+    "DISABLE_X_ANALYTICS",
+    "DISALLOW_PLUS",
+    "FEE_AMOUNT",
+    "HIDDEN_PROVIDERS",
+    "IS_GENERAL",
+    "MEWE_HOST",
+    "MIGRATE_PROVIDERS",
+    "NEXT_PUBLIC_DISCORD_SUPPORT",
+    "NOWPAYMENTS_AMOUNT",
+    "RUN_CRON",
+    "STORAGE_PROVIDER",
+    "STRIP_LINKS_FROM_X_POSTS",
+    "UPLOAD_DIRECTORY",
+    "WORKER_CONCURRENCY_DIVIDER",
+    "X_URL"
+  ],
+  "shared": []
+}

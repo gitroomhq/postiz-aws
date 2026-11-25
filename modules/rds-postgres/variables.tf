@@ -104,3 +104,21 @@ variable "connections_alarm_threshold" {
   type        = number
   default     = 1000
 }
+
+variable "performance_insights" {
+  description = "Performance Insights (7 days free). Off for the smallest burstable classes, which may not offer it."
+  type        = bool
+  default     = true
+}
+
+variable "free_storage_alarm_gib" {
+  description = "Alarm when free storage stays under this many GiB."
+  type        = number
+  default     = 10
+}
+
+variable "freeable_memory_alarm_mib" {
+  description = "Alarm when freeable memory stays under this many MiB. Lower it for small instances (db.t4g.micro has 1 GiB in all)."
+  type        = number
+  default     = 512
+}
